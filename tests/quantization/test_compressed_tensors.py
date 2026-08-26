@@ -35,6 +35,9 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     CompressedTensorsWNA8O8Int,
     CompressedTensorsWNA16,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_embedding import (  # noqa: E501
+    CompressedTensorsEmbeddingW8A16Fp8,
+)
 from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
 )
@@ -59,6 +62,35 @@ ROCM_TRITON_SCALED_MM_SUPPORTED_INT8_MODEL = [
     "nm-testing/tinyllama-oneshot-w8a8-dynamic-token-v2",
     "nm-testing/tinyllama-oneshot-w8a8-channel-dynamic-token-v2",
 ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("strategy", ["tensor", "channel"])
+def test_compressed_tensors_fp8_embedding_gather(strategy):
+    args = QuantizationArgs(
+        num_bits=8,
+        type="float",
+        strategy=strategy,
+        symmetric=True,
+        dynamic=False,
+    )
+    method = CompressedTensorsEmbeddingW8A16Fp8(args)
+    weight = torch.tensor(
+        [[1, 2, -3, 4], [2, -1, 3, 4], [4, 2, 1, -2]],
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    scale = (
+        torch.tensor([[0.25], [0.5], [0.125]], device="cuda")
+        if strategy == "channel"
+        else torch.tensor([0.25], device="cuda")
+    )
+    layer = Mock(weight=weight, weight_scale=scale, hidden_size=4)
+    ids = torch.tensor([[2, 0], [1, 2]], device="cuda")
+    actual = method.embedding(layer, ids).float()
+    selected_scale = scale[ids] if strategy == "channel" else scale
+    expected = weight[ids].float() * selected_scale
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -628,6 +660,19 @@ def test_get_quant_method_returns_linear_method_for_parallel_lm_head():
     )
 
 
+def test_get_quant_method_matches_bare_nested_parallel_lm_head_target():
+    """A bare lm_head target must survive a runtime wrapper namespace."""
+    config = _make_ct_config(target="lm_head")
+    mock_lm_head = Mock(spec=ParallelLMHead)
+    mock_lm_head.__class__ = ParallelLMHead
+
+    method = config.get_quant_method(
+        mock_lm_head, prefix="model.language_model.lm_head"
+    )
+
+    assert isinstance(method, CompressedTensorsLinearMethod)
+
+
 def test_get_quant_method_returns_none_for_ignored_parallel_lm_head():
     """ParallelLMHead on the ignore list should be left unquantized (None)."""
     config = _make_ct_config(target="re:.*lm_head")
@@ -666,6 +711,40 @@ def test_find_matched_target_returns_none_on_no_match():
         module=Mock(spec=torch.nn.Linear),
         targets=["no_match_target"],
     )
+    assert result is None
+
+
+def test_find_matched_target_accepts_runtime_wrapper_namespace():
+    target = "model.layers.1.mlp.experts"
+
+    result = find_matched_target(
+        layer_name="language_model.model.layers.1.mlp.experts",
+        module=Mock(spec=torch.nn.Linear),
+        targets=[target],
+    )
+
+    assert result == target
+
+
+def test_find_matched_target_accepts_subtree_target_with_wrapper_namespace():
+    target = "model.layers.1.mlp.experts"
+
+    result = find_matched_target(
+        layer_name="language_model.model.layers.1.mlp.experts.0.gate_proj",
+        module=Mock(spec=torch.nn.Linear),
+        targets=[target],
+    )
+
+    assert result == target
+
+
+def test_find_matched_target_respects_path_segment_boundaries():
+    result = find_matched_target(
+        layer_name="language_model.model.layers.10.mlp.experts.0.gate_proj",
+        module=Mock(spec=torch.nn.Linear),
+        targets=["model.layers.1.mlp.experts"],
+    )
+
     assert result is None
 
 

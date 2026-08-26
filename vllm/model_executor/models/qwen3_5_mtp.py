@@ -80,11 +80,14 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
 
+        embed_quant_prefix = maybe_prefix(prefix, "embed_tokens")
+        if not getattr(config, "mtp_use_dedicated_embeddings", False):
+            embed_quant_prefix = "model.embed_tokens"
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
             quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "embed_tokens"),
+            prefix=embed_quant_prefix,
         )
 
         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is

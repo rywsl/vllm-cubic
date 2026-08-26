@@ -74,7 +74,10 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
@@ -600,7 +603,13 @@ class Qwen3_VisionTransformer(nn.Module):
             hidden_size=self.hidden_size,
         )
 
-        self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
+        self.pos_embed = VocabParallelEmbedding(
+            self.num_position_embeddings,
+            self.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "pos_embed"),
+            disable_tp=True,
+        )
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
@@ -723,7 +732,7 @@ class Qwen3_VisionTransformer(nn.Module):
         for t, h, w in grid_thw:
             outputs.append(
                 interpolate_fn(
-                    self.pos_embed.weight,
+                    self.pos_embed.dequantized_weight(),
                     t,
                     h,
                     w,

@@ -15,11 +15,128 @@ from vllm.model_executor.parameter import (
     BasevLLMParameter,
     ChannelQuantScaleParameter,
     GroupQuantScaleParameter,
+    ModelWeightParameter,
     PackedvLLMParameter,
 )
 from vllm.triton_utils import tl, triton
 
-__all__ = ["CompressedTensorsEmbeddingWNA16Int"]
+__all__ = [
+    "CompressedTensorsEmbeddingW8A16Fp8",
+    "CompressedTensorsEmbeddingWNA16Int",
+]
+
+
+@triton.jit
+def _fp8_dequant_gather_kernel(
+    ids_ptr,
+    weight_ptr,
+    scale_ptr,
+    out_ptr,
+    hidden,
+    SCALE_STRATEGY: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = col < hidden
+    tid = tl.load(ids_ptr + row).to(tl.int64)
+    value = tl.load(weight_ptr + tid * hidden + col, mask=mask, other=0.0)
+    scale_row = tid if SCALE_STRATEGY == 1 else 0
+    scale = tl.load(scale_ptr + scale_row)
+    tl.store(
+        out_ptr + row * hidden + col,
+        value.to(tl.float32) * scale.to(tl.float32),
+        mask=mask,
+    )
+
+
+class CompressedTensorsEmbeddingW8A16Fp8(QuantizeMethodBase):
+    """FP8 embedding with fused lookup and dequantization."""
+
+    def __init__(self, weight_quant: QuantizationArgs):
+        self.strategy = weight_quant.strategy
+        if self.strategy not in {
+            QuantizationStrategy.CHANNEL.value,
+            QuantizationStrategy.TENSOR.value,
+        }:
+            raise ValueError(
+                "FP8 embeddings support tensor or output-channel weight scales, "
+                f"got {self.strategy}."
+            )
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        weight_loader = extra_weight_attrs["weight_loader"]
+        vocab_pp = sum(output_partition_sizes)
+        layer.hidden_size = input_size_per_partition
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                vocab_pp,
+                input_size_per_partition,
+                dtype=torch.float8_e4m3fn,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        if self.strategy == QuantizationStrategy.CHANNEL.value:
+            weight_scale = ChannelQuantScaleParameter(
+                data=torch.empty(vocab_pp, 1, dtype=torch.float32),
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+        else:
+            weight_scale = BasevLLMParameter(
+                data=torch.empty(1, dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
+        layer.register_parameter("weight", weight)
+        layer.register_parameter("weight_scale", weight_scale)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        pass
+
+    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        ids = input_.reshape(-1).contiguous()
+        hidden = layer.hidden_size
+        output = torch.empty(
+            ids.numel(),
+            hidden,
+            dtype=torch.get_default_dtype(),
+            device=layer.weight.device,
+        )
+        block = min(triton.next_power_of_2(hidden), 1024)
+        grid = (ids.numel(), triton.cdiv(hidden, block))
+        _fp8_dequant_gather_kernel[grid](
+            ids,
+            layer.weight,
+            layer.weight_scale,
+            output,
+            hidden,
+            SCALE_STRATEGY=int(
+                self.strategy == QuantizationStrategy.CHANNEL.value
+            ),
+            BLOCK=block,
+        )
+        return output.reshape(*input_.shape, hidden)
+
+    def dequantize_weight(self, layer: torch.nn.Module) -> torch.Tensor:
+        return (layer.weight.float() * layer.weight_scale.float()).to(
+            torch.get_default_dtype()
+        )
+
+    def apply(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:
+        raise NotImplementedError(
+            "CompressedTensorsEmbeddingW8A16Fp8 supports embedding lookup only"
+        )
 
 
 @triton.jit
