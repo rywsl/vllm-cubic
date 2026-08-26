@@ -190,6 +190,15 @@ def _is_equal_or_regex_match(
             return True
     elif target == value:
         return True
+    elif "." in target:
+        start = value.find(target)
+        while start >= 0:
+            end = start + len(target)
+            starts_on_boundary = start == 0 or value[start - 1] == "."
+            ends_on_boundary = end == len(value) or value[end] == "."
+            if starts_on_boundary and ends_on_boundary:
+                return True
+            start = value.find(target, start + 1)
     return False
 
 

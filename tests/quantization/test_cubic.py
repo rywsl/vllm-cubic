@@ -17,6 +17,7 @@ from vllm.model_executor.layers.quantization.cubic import (
     CubicEmbeddingMethod,
     CubicLinearMetadataParameter,
     CubicLinearMethod,
+    CubicMoEMethod,
     CubicScheme,
     cubic_is_strictly_monotonic,
     cubic_levels,
@@ -26,6 +27,12 @@ from vllm.model_executor.layers.quantization.cubic import (
     pack_cubic_codes,
     quantize_cubic,
     unpack_cubic_codes,
+)
+from vllm.model_executor.layers.quantization.cubic import (
+    _decode_cubic_moe_compact_metadata as decode_cubic_moe_compact_metadata,
+)
+from vllm.model_executor.layers.quantization.cubic import (
+    _decode_cubic_moe_e5m9_curve2_metadata as decode_cubic_moe_curve2_metadata,
 )
 
 
@@ -865,6 +872,132 @@ def test_cubic_compact_metadata_decodes_per_logical_partition():
     )
 
 
+def test_cubic_moe_compact_metadata_decodes_per_expert_and_partition():
+    scale_code = torch.tensor(
+        [
+            [[2, 3], [4, 5], [6, 7]],
+            [[8, 9], [10, 11], [12, 13]],
+        ],
+        dtype=torch.int8,
+    )
+    a_code = torch.tensor(
+        [
+            [[1, -2], [3, -4], [5, -6]],
+            [[-1, 2], [-3, 4], [-5, 6]],
+        ],
+        dtype=torch.int8,
+    )
+    b_code = -a_code
+    packed_ab = ((a_code & 0xF) | ((b_code & 0xF) << 4)).to(torch.uint8)
+    scale_global = torch.tensor([[0.5, 0.25], [0.125, 0.75]])
+    a_global = torch.tensor([[0.125, 0.25], [0.5, 0.0625]])
+    b_global = torch.tensor([[0.25, 0.5], [0.125, 0.75]])
+
+    scale, a, b = decode_cubic_moe_compact_metadata(
+        scale_code,
+        packed_ab,
+        scale_global,
+        a_global,
+        b_global,
+        (2, 1),
+        1,
+    )
+
+    partition = torch.tensor([0, 0, 1])
+    expected_scale = scale_code.float() * scale_global[:, partition, None]
+    expected_a = 1.0 + a_code.float() * a_global[:, partition, None]
+    expected_b = b_code.float() * b_global[:, partition, None]
+    torch.testing.assert_close(scale, expected_scale)
+    torch.testing.assert_close(a, expected_a.half())
+    torch.testing.assert_close(b, expected_b.half())
+
+
+@pytest.mark.parametrize(
+    "metadata_format",
+    [CUBIC_COMPACT_METADATA_FORMAT, CUBIC_E5M9_CURVE2_METADATA_FORMAT],
+)
+def test_cubic_moe_keeps_checkpoint_metadata_compact_after_loading(
+    metadata_format: str,
+):
+    layer = torch.nn.Module()
+    layer.cubic_loaded_shards = {"all": torch.ones(2, 2, dtype=torch.bool)}
+    layer.cubic_hidden_size = 4
+    layer.cubic_intermediate_size = 4
+    layer.cubic_runtime_group_size = 2
+    layer.register_parameter(
+        "w13_weight_packed",
+        torch.nn.Parameter(torch.zeros(2, 8, 2, dtype=torch.uint8), False),
+    )
+    layer.register_parameter(
+        "w2_weight_packed",
+        torch.nn.Parameter(torch.zeros(2, 4, 2, dtype=torch.uint8), False),
+    )
+    if metadata_format == CUBIC_COMPACT_METADATA_FORMAT:
+        for prefix, shape, partitions in (
+            ("w13", (2, 8, 2), 2),
+            ("w2", (2, 4, 2), 1),
+        ):
+            layer.register_parameter(
+                f"{prefix}_weight_scale",
+                torch.nn.Parameter(torch.ones(shape, dtype=torch.int8), False),
+            )
+            layer.register_parameter(
+                f"{prefix}_weight_ab",
+                torch.nn.Parameter(torch.zeros(shape, dtype=torch.uint8), False),
+            )
+            for suffix in ("scale", "a", "b"):
+                layer.register_parameter(
+                    f"{prefix}_weight_{suffix}_global",
+                    torch.nn.Parameter(
+                        torch.ones(2, partitions, dtype=torch.float32), False
+                    ),
+                )
+    else:
+        for prefix, shape, partitions in (
+            ("w13", (2, 8, 2), 2),
+            ("w2", (2, 4, 2), 1),
+        ):
+            layer.register_parameter(
+                f"{prefix}_weight_metadata",
+                torch.nn.Parameter(torch.zeros(shape, dtype=torch.uint16), False),
+            )
+            for suffix in ("a", "b"):
+                layer.register_parameter(
+                    f"{prefix}_weight_curve_{suffix}",
+                    torch.nn.Parameter(
+                        torch.ones(2, partitions, 4, dtype=torch.float16), False
+                    ),
+                )
+
+    before = {
+        name: (value.dtype, tuple(value.shape), value.numel() * value.element_size())
+        for name, value in layer.named_parameters()
+    }
+    method = CubicMoEMethod(
+        CubicScheme(
+            num_bits=4,
+            group_size=2,
+            group_out=1,
+            metadata_format=metadata_format,
+        ),
+        SimpleNamespace(),
+        dynamic_a8=True,
+    )
+
+    method.process_weights_after_loading(layer)
+
+    after = {
+        name: (value.dtype, tuple(value.shape), value.numel() * value.element_size())
+        for name, value in layer.named_parameters()
+    }
+    assert after == before
+    assert not any("expanded" in name for name, _ in layer.named_buffers())
+    assert not hasattr(layer, "w13_weight_a")
+    assert not hasattr(layer, "w13_weight_b")
+    assert not hasattr(layer, "w2_weight_a")
+    assert not hasattr(layer, "w2_weight_b")
+
+
 def test_cubic_config_accepts_compact_metadata():
     config = CubicConfig.from_config(
         {
@@ -1000,6 +1133,84 @@ def test_cubic_dynamic_a8_keeps_compact_metadata_resident_after_loading():
     assert not hasattr(layer, "weight_carrier")
     assert not hasattr(layer, "weight_a")
     assert not hasattr(layer, "weight_b")
+
+
+@pytest.mark.parametrize(
+    "metadata_format",
+    (CUBIC_COMPACT_METADATA_FORMAT, CUBIC_E5M9_CURVE2_METADATA_FORMAT),
+)
+def test_cubic_moe_runtime_metadata_preserves_checkpoint_storage(metadata_format):
+    layer = torch.nn.Module()
+    layer.cubic_hidden_size = 64
+    layer.cubic_intermediate_size = 128
+    metadata_shape = (2, 128, 2)
+
+    def register(name: str, value: torch.Tensor) -> torch.Tensor:
+        parameter = torch.nn.Parameter(value, requires_grad=False)
+        layer.register_parameter(name, parameter)
+        return parameter
+
+    if metadata_format == CUBIC_COMPACT_METADATA_FORMAT:
+        for prefix in ("w13", "w2"):
+            register(
+                f"{prefix}_weight_scale",
+                torch.ones(metadata_shape, dtype=torch.int8),
+            )
+            register(
+                f"{prefix}_weight_ab",
+                torch.zeros(metadata_shape, dtype=torch.uint8),
+            )
+            for suffix in ("scale", "a", "b"):
+                register(
+                    f"{prefix}_weight_{suffix}_global",
+                    torch.ones((2, 2 if prefix == "w13" else 1), dtype=torch.float32),
+                )
+    else:
+        for prefix in ("w13", "w2"):
+            register(
+                f"{prefix}_weight_metadata",
+                torch.ones(metadata_shape, dtype=torch.uint16),
+            )
+            partitions = 2 if prefix == "w13" else 1
+            register(
+                f"{prefix}_weight_curve_a",
+                torch.ones((2, partitions, 4), dtype=torch.float16),
+            )
+            register(
+                f"{prefix}_weight_curve_b",
+                torch.ones((2, partitions, 4), dtype=torch.float16),
+            )
+
+    method = object.__new__(CubicMoEMethod)
+    method.scheme = CubicScheme(
+        num_bits=6,
+        group_size=32,
+        group_out=1,
+        metadata_format=metadata_format,
+    )
+    before = {name: value.data_ptr() for name, value in layer.state_dict().items()}
+
+    runtime = method.runtime_metadata(layer)
+
+    after = {name: value.data_ptr() for name, value in layer.state_dict().items()}
+    assert after == before
+    assert runtime[6] is not None
+    assert runtime[7] is not None
+    if metadata_format == CUBIC_COMPACT_METADATA_FORMAT:
+        assert runtime[0] is layer.w13_weight_scale
+        assert runtime[1] is layer.w2_weight_scale
+        assert runtime[2] is layer.w13_weight_ab
+        assert runtime[4] is layer.w2_weight_ab
+        assert runtime[6].primary.dtype == torch.int8
+        assert runtime[6].secondary.dtype == torch.uint8
+    else:
+        assert runtime[0] is layer.w13_weight_metadata
+        assert runtime[1] is layer.w2_weight_metadata
+        assert runtime[2] is layer.w13_weight_curve_a
+        assert runtime[4] is layer.w2_weight_curve_a
+        assert runtime[6].primary.dtype == torch.uint16
+        assert runtime[6].secondary.dtype == torch.float16
+    assert not any("expanded" in name for name in after)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -2878,6 +3089,332 @@ def test_cubic_a16_moe_supports_two_dimensional_groups(
     relative_rmse /= expected.square().mean().sqrt()
     assert torch.isfinite(actual).all()
     assert relative_rmse.item() < 0.01
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dynamic_a8", (True,))
+@pytest.mark.parametrize("tokens", (1, 16, 32, 128))
+@pytest.mark.parametrize(
+    "bits,group_size",
+    ((5, 32), (6, 32), (7, 32), (5, 128), (6, 64), (8, 128)),
+)
+@pytest.mark.parametrize("grouped_routes", (1, 2, 4, 8))
+def test_cubic_moe_int8_int4_metadata_matches_expanded_path(
+    dynamic_a8: bool,
+    tokens: int,
+    bits: int,
+    group_size: int,
+    grouped_routes: int,
+):
+    import vllm.model_executor.layers.quantization.cubic_kernels as cubic_kernels
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        CubicMoECompactMetadata,
+        cubic_fused_moe,
+        cubic_fused_moe_dynamic_a8,
+    )
+
+    device = torch.device("cuda")
+    experts, hidden, intermediate, top_k = 8, 512, 512, 8
+    global_experts = 16
+    generator = torch.Generator(device=device).manual_seed(20260823)
+
+    def make_weight(
+        output_size: int,
+        input_size: int,
+        partitions: tuple[int, ...],
+    ):
+        magnitude_max = (1 << (bits - 1)) - 1
+        codes = torch.randint(
+            -magnitude_max,
+            magnitude_max + 1,
+            (experts, output_size, input_size),
+            generator=generator,
+            device=device,
+            dtype=torch.int16,
+        )
+        packed = pack_cubic_codes(codes, bits)
+        metadata_shape = (experts, output_size, input_size // group_size)
+        scale_code = torch.randint(
+            1,
+            9,
+            metadata_shape,
+            generator=generator,
+            device=device,
+            dtype=torch.int8,
+        )
+        a_code = torch.randint(
+            -3,
+            4,
+            metadata_shape,
+            generator=generator,
+            device=device,
+            dtype=torch.int8,
+        )
+        b_code = torch.randint(
+            -3,
+            4,
+            metadata_shape,
+            generator=generator,
+            device=device,
+            dtype=torch.int8,
+        )
+        packed_ab = ((a_code & 0xF) | ((b_code & 0xF) << 4)).to(torch.uint8)
+        num_partitions = len(partitions)
+        scale_global = torch.full(
+            (experts, num_partitions), 0.002, device=device, dtype=torch.float32
+        )
+        a_global = torch.full_like(scale_global, 0.03125)
+        b_global = torch.full_like(scale_global, 0.03125)
+        scale, a, b = decode_cubic_moe_compact_metadata(
+            scale_code,
+            packed_ab,
+            scale_global,
+            a_global,
+            b_global,
+            partitions,
+            1,
+        )
+        compact = CubicMoECompactMetadata(
+            scale_code,
+            packed_ab,
+            packed_ab,
+            scale_global,
+            a_global,
+            b_global,
+            1,
+            partitions[0],
+            num_partitions,
+        )
+        return packed, scale, a, b, compact
+
+    w13 = make_weight(2 * intermediate, hidden, (intermediate, intermediate))
+    w2 = make_weight(hidden, intermediate, (hidden,))
+    x = torch.randn(tokens, hidden, generator=generator, device=device).to(
+        torch.bfloat16
+    )
+    topk_ids = torch.tensor(
+        [[0, 1, 8, 9, 2, 10, 3, 11]], device=device, dtype=torch.int32
+    ).repeat(tokens, 1)
+    expert_map = torch.cat(
+        (
+            torch.arange(experts, device=device, dtype=torch.int32),
+            torch.full((experts,), -1, device=device, dtype=torch.int32),
+        )
+    )
+    topk_weights = torch.softmax(
+        torch.randn(tokens, top_k, generator=generator, device=device), dim=-1
+    )
+    func = cubic_fused_moe_dynamic_a8 if dynamic_a8 else cubic_fused_moe
+    common = dict(
+        activation=MoEActivation.SITU,
+        apply_router_weight_on_input=False,
+        global_num_experts=global_experts,
+        expert_map=expert_map,
+        num_bits=bits,
+        group_size=group_size,
+        group_out=1,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        activation_situ_beta=4.0,
+        activation_situ_linear_beta=25.0,
+    )
+    native_supported = cubic_kernels._cubic_compact_a8_native_supported
+    grouping = cubic_kernels._cubic_a8_moe_grouping
+    cubic_kernels._cubic_a8_moe_grouping = lambda **_: grouped_routes
+    cubic_kernels._cubic_compact_a8_native_supported = lambda **_: False
+    try:
+        expected = func(
+            x,
+            w13[0],
+            w2[0],
+            w13[4].primary,
+            w2[4].primary,
+            w13[4].secondary,
+            w13[4].tertiary,
+            w2[4].secondary,
+            w2[4].tertiary,
+            topk_weights,
+            topk_ids,
+            w13_compact_metadata=w13[4],
+            w2_compact_metadata=w2[4],
+            **common,
+        )
+    finally:
+        cubic_kernels._cubic_compact_a8_native_supported = native_supported
+    try:
+        actual = func(
+            x,
+            w13[0],
+            w2[0],
+            w13[4].primary,
+            w2[4].primary,
+            w13[4].secondary,
+            w13[4].tertiary,
+            w2[4].secondary,
+            w2[4].tertiary,
+            topk_weights,
+            topk_ids,
+            w13_compact_metadata=w13[4],
+            w2_compact_metadata=w2[4],
+            **common,
+        )
+    finally:
+        cubic_kernels._cubic_a8_moe_grouping = grouping
+
+    cubic_kernels._assert_cubic_reduction_equivalent(
+        actual,
+        expected,
+        allow_route_reduction=grouped_routes > 1,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dynamic_a8", (False, True))
+@pytest.mark.parametrize("tokens", (1, 16, 64, 128))
+@pytest.mark.parametrize("grouped_routes", (1, 2, 4, 8))
+def test_cubic_moe_curve2_metadata_matches_expanded_path(
+    dynamic_a8: bool, tokens: int, grouped_routes: int
+):
+    import vllm.model_executor.layers.quantization.cubic_kernels as cubic_kernels
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        CubicMoECompactMetadata,
+        cubic_fused_moe,
+        cubic_fused_moe_dynamic_a8,
+    )
+    device = torch.device("cuda")
+    experts, hidden, intermediate, top_k = 2, 64, 64, 2
+    bits, group_size = 6, 32
+    generator = torch.Generator(device=device).manual_seed(20260824)
+
+    def make_weight(
+        output_size: int,
+        input_size: int,
+        partitions: tuple[int, ...],
+    ):
+        magnitude_max = (1 << (bits - 1)) - 1
+        codes = torch.randint(
+            -magnitude_max,
+            magnitude_max + 1,
+            (experts, output_size, input_size),
+            generator=generator,
+            device=device,
+            dtype=torch.int16,
+        )
+        packed = pack_cubic_codes(codes, bits)
+        metadata_shape = (experts, output_size, input_size // group_size)
+        curve_id = torch.randint(
+            0,
+            4,
+            metadata_shape,
+            generator=generator,
+            device=device,
+            dtype=torch.int32,
+        )
+        scale_bits = (
+            torch.full(metadata_shape, 0.01, device=device, dtype=torch.float16)
+            .view(torch.uint16)
+            .to(torch.int32)
+            >> 1
+        )
+        metadata = (scale_bits | (curve_id << 14)).to(torch.uint16)
+        num_partitions = len(partitions)
+        curve_a = torch.tensor(
+            [0.25, 0.5, 0.75, 1.0], device=device, dtype=torch.float16
+        ).repeat(experts, num_partitions, 1)
+        curve_b = torch.tensor(
+            [-0.125, 0.0, 0.125, 0.25], device=device, dtype=torch.float16
+        ).repeat(experts, num_partitions, 1)
+        scale, a, b = decode_cubic_moe_curve2_metadata(
+            metadata,
+            curve_a,
+            curve_b,
+            partitions,
+            1,
+        )
+        compact = CubicMoECompactMetadata(
+            metadata,
+            curve_a,
+            curve_b,
+            curve_a,
+            curve_a,
+            curve_b,
+            2,
+            partitions[0],
+            num_partitions,
+        )
+        return packed, scale, a, b, compact
+
+    w13 = make_weight(2 * intermediate, hidden, (intermediate, intermediate))
+    w2 = make_weight(hidden, intermediate, (hidden,))
+    x = torch.randn(tokens, hidden, generator=generator, device=device).to(
+        torch.bfloat16
+    )
+    topk_ids = torch.tensor([[0, 1]], device=device, dtype=torch.int32).repeat(
+        tokens, 1
+    )
+    topk_weights = torch.softmax(
+        torch.randn(tokens, top_k, generator=generator, device=device), dim=-1
+    )
+    func = cubic_fused_moe_dynamic_a8 if dynamic_a8 else cubic_fused_moe
+    common = dict(
+        activation=MoEActivation.SITU,
+        apply_router_weight_on_input=False,
+        global_num_experts=experts,
+        expert_map=None,
+        num_bits=bits,
+        group_size=group_size,
+        group_out=1,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        activation_situ_beta=4.0,
+        activation_situ_linear_beta=25.0,
+    )
+    native_supported = cubic_kernels._cubic_compact_a8_native_supported
+    grouping = cubic_kernels._cubic_a8_moe_grouping
+    if dynamic_a8:
+        cubic_kernels._cubic_compact_a8_native_supported = lambda **_: False
+    try:
+        expected = func(
+            x,
+            w13[0],
+            w2[0],
+            w13[1],
+            w2[1],
+            w13[2],
+            w13[3],
+            w2[2],
+            w2[3],
+            topk_weights,
+            topk_ids,
+            **common,
+        )
+    finally:
+        cubic_kernels._cubic_compact_a8_native_supported = native_supported
+    if dynamic_a8:
+        cubic_kernels._cubic_a8_moe_grouping = lambda **_: grouped_routes
+    try:
+        actual = func(
+            x,
+            w13[0],
+            w2[0],
+            w13[4].primary,
+            w2[4].primary,
+            w13[4].secondary,
+            w13[4].tertiary,
+            w2[4].secondary,
+            w2[4].tertiary,
+            topk_weights,
+            topk_ids,
+            w13_compact_metadata=w13[4],
+            w2_compact_metadata=w2[4],
+            **common,
+        )
+    finally:
+        cubic_kernels._cubic_a8_moe_grouping = grouping
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

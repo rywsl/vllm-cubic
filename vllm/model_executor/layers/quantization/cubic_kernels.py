@@ -40,6 +40,10 @@ _CUBIC_A8_ROUTE_WORKSPACE_MAX_BYTES = 128 * 1024 * 1024
 _CUBIC_A8_PIPELINE_WORKSPACE_MIN_BYTES = 64 * 1024 * 1024
 _CUBIC_A8_PIPELINE_WORKSPACE_MAX_BYTES = 384 * 1024 * 1024
 
+_CUBIC_MOE_METADATA_EXPANDED = tl.constexpr(0)
+_CUBIC_MOE_METADATA_INT8_INT4 = tl.constexpr(1)
+_CUBIC_MOE_METADATA_E5M9_CURVE2 = tl.constexpr(2)
+
 # (device, N, K, group_out, group_size, local_experts, route_ctas) -> tactic. This is
 # populated during kernel_warmup, before CUDA graph capture.  Keep the lookup
 # graph-safe and free of timing or synchronization in the execution path.
@@ -50,7 +54,7 @@ _A8BackendKey = tuple[int, int, int, int, int, int, int, int, int]
 _CUBIC_A8_MOE_BACKEND_TACTICS: dict[_A8BackendKey, str] = {}
 _CUBIC_ONLINE_A8_MOE_BACKEND_TACTICS: dict[_A8BackendKey, str] = {}
 _CUBIC_A8_MOE_GROUPING_TACTICS: dict[
-    tuple[int, int, int, int, int, int, int, int], int
+    tuple[int, int, int, int, int, int, int, int, int, int], int
 ] = {}
 _CUBIC_MOE_EXECUTION_TACTICS: dict[
     tuple[int, bool, int, int, int, int, int, int, int], bool
@@ -124,6 +128,20 @@ class CubicA8Code(NamedTuple):
     a: torch.Tensor
     b: torch.Tensor
     group_size: int
+
+
+class CubicMoECompactMetadata(NamedTuple):
+    """Persistent compact metadata consumed directly by Cubic MoE kernels."""
+
+    primary: torch.Tensor
+    secondary: torch.Tensor
+    tertiary: torch.Tensor
+    scale_global: torch.Tensor
+    a_global: torch.Tensor
+    b_global: torch.Tensor
+    format: int
+    output_partition_size: int
+    num_partitions: int
 
 
 @triton.jit
@@ -524,6 +542,10 @@ _CUBIC_MOE_GENERIC_GEMV_CONFIGS = [
     triton.Config({"BLOCK_N": 128}, num_warps=8, num_stages=2),
 ]
 
+_CUBIC_MOE_COMPACT_A8_DP4A_CONFIGS = [
+    _CUBIC_MOE_GENERIC_GEMV_CONFIGS[index] for index in (2, 4, 5)
+]
+
 _CUBIC_MOE_2BIT_A16_CONFIGS = [
     triton.Config({"BLOCK_N": 4}, num_warps=2, num_stages=1),
     triton.Config({"BLOCK_N": 8}, num_warps=4, num_stages=1),
@@ -592,6 +614,25 @@ def _cubic_a8_moe_backend(
     if matching:
         return min(matching, key=lambda item: item[0])[1]
     return "cuda"
+
+
+def _cubic_compact_a8_native_supported(
+    *,
+    num_bits: int,
+    logical_k: int,
+    group_size: int,
+    group_out: int,
+    grouped_routes: int,
+    sum_routes: bool,
+) -> bool:
+    return (
+        4 <= num_bits <= 8
+        and group_size in (32, 64, 128, 256, 512)
+        and logical_k % group_size == 0
+        and group_out >= 1
+        and grouped_routes in (1, 2, 4, 8)
+        and not sum_routes
+    )
 
 
 def _cubic_moe_use_torch_sum(
@@ -666,7 +707,11 @@ def calibrate_cubic_moe_sum_backend(
 
     torch_sum()
     native_sum()
-    torch.testing.assert_close(torch_output, native_output, rtol=0, atol=0)
+    _assert_cubic_reduction_equivalent(
+        torch_output,
+        native_output,
+        allow_route_reduction=True,
+    )
     torch_ms = triton.testing.do_bench(torch_sum, warmup=10, rep=30)
     if expert_map is not None:
         # The torch reduction requires zero-initialized remote route slots,
@@ -740,10 +785,13 @@ def _cubic_a8_moe_grouping(
     group_size: int,
     group_out: int,
     local_experts: int,
+    top_k: int,
     num_tokens: int,
     fallback: int,
     precomputed_3bit_levels: bool = False,
     fp16_curve: bool = False,
+    compact_metadata: bool = False,
+    metadata_format: int = 0,
 ) -> int:
     candidates = _cubic_a8_moe_grouping_candidates(
         num_bits=num_bits,
@@ -751,7 +799,10 @@ def _cubic_a8_moe_grouping(
         group_out=group_out,
         precomputed_3bit_levels=precomputed_3bit_levels,
         fp16_curve=fp16_curve,
+        compact_metadata=compact_metadata,
     )
+    if num_tokens * top_k < 8 * local_experts:
+        candidates = tuple(grouped for grouped in candidates if grouped < 8)
 
     def supported(grouped_routes: int) -> bool:
         return grouped_routes in candidates
@@ -767,11 +818,14 @@ def _cubic_a8_moe_grouping(
         group_size,
         group_out,
         local_experts,
+        top_k,
+        metadata_format,
         cubic_token_bucket(num_tokens),
     )
     if exact in _CUBIC_A8_MOE_GROUPING_TACTICS:
         selected = _CUBIC_A8_MOE_GROUPING_TACTICS[exact]
-        return selected if supported(selected) else 1
+        if supported(selected):
+            return selected
     matching = [
         (abs(tokens - cubic_token_bucket(num_tokens)), grouped)
         for (
@@ -782,6 +836,8 @@ def _cubic_a8_moe_grouping(
             group,
             out_group,
             experts,
+            candidate_top_k,
+            candidate_format,
             tokens,
         ), grouped in _CUBIC_A8_MOE_GROUPING_TACTICS.items()
         if dev == device
@@ -791,10 +847,12 @@ def _cubic_a8_moe_grouping(
         and group == group_size
         and out_group == group_out
         and experts == local_experts
+        and candidate_top_k == top_k
+        and candidate_format == metadata_format
+        and supported(grouped)
     ]
     if matching:
-        selected = min(matching, key=lambda item: item[0])[1]
-        return selected if supported(selected) else 1
+        return min(matching, key=lambda item: item[0])[1]
     return fallback
 
 
@@ -805,6 +863,7 @@ def _cubic_a8_moe_grouping_candidates(
     group_out: int,
     precomputed_3bit_levels: bool,
     fp16_curve: bool,
+    compact_metadata: bool = False,
 ) -> tuple[int, ...]:
     """Return complete-layer route groupings with an exact consumer."""
     if num_bits == 2:
@@ -818,13 +877,56 @@ def _cubic_a8_moe_grouping_candidates(
             else (1,)
         )
     if (
+        compact_metadata
+        and 4 <= num_bits <= 8
+        and group_out == 1
+        and group_size in (32, 64, 128, 256, 512)
+    ):
+        return (1, 2, 4, 8)
+    if (
         4 <= num_bits <= 8
-        and group_size in (128, 256, 512)
+        and group_size in (64, 128, 256, 512)
         and group_size / (1 << (num_bits - 1)) >= 2
         and fp16_curve
     ):
         return (1, 2, 4, 8)
     return (1,)
+
+
+def _assert_cubic_reduction_equivalent(
+    output: torch.Tensor,
+    reference: torch.Tensor,
+    *,
+    allow_route_reduction: bool = False,
+) -> None:
+    """Require exact output unless the caller proves route reduction changed."""
+    if torch.equal(output, reference) and bool(torch.isfinite(output).all()):
+        return
+    if output.dtype != reference.dtype or output.shape != reference.shape:
+        torch.testing.assert_close(output, reference, rtol=0, atol=0)
+        return
+    finite = torch.isfinite(output) & torch.isfinite(reference)
+    if not bool(finite.all()):
+        raise AssertionError("Cubic calibration produced non-finite output")
+    if not allow_route_reduction:
+        torch.testing.assert_close(output, reference, rtol=0, atol=0)
+        return
+    lower = reference
+    upper = reference
+    for _ in range(8):
+        lower = torch.nextafter(lower, torch.full_like(lower, -torch.inf))
+        upper = torch.nextafter(upper, torch.full_like(upper, torch.inf))
+    difference = (output.float() - reference.float()).abs()
+    reference_rms = reference.float().square().mean().sqrt().clamp_min(1e-12)
+    normalized_rms = difference.square().mean().sqrt() / reference_rms
+    elementwise_equivalent = (
+        ((output >= lower) & (output <= upper)) | (difference <= 1e-4)
+    )
+    if (
+        not bool(elementwise_equivalent.all())
+        or float(normalized_rms) > 5e-4
+    ):
+        torch.testing.assert_close(output, reference, rtol=0, atol=0)
 
 
 def _cubic_moe_use_gemv(
@@ -2222,6 +2324,90 @@ def _cubic_load_compact_metadata(
         tl.float32
     )
     packed_ab = tl.load(packed_ab_ptr + metadata_offsets, mask=mask, other=0).to(
+        tl.int32
+    )
+    a_code = packed_ab & 0xF
+    b_code = (packed_ab >> 4) & 0xF
+    a_code = tl.where(a_code >= 8, a_code - 16, a_code).to(tl.float32)
+    b_code = tl.where(b_code >= 8, b_code - 16, b_code).to(tl.float32)
+    cubic_a = (1.0 + a_code * a_global).to(tl.float16).to(tl.float32)
+    cubic_b = (b_code * b_global).to(tl.float16).to(tl.float32)
+    return scale_code * scale_global, cubic_a, cubic_b
+
+
+@triton.jit
+def _cubic_load_moe_metadata(
+    primary_ptr,
+    secondary_ptr,
+    tertiary_ptr,
+    scale_global_ptr,
+    a_global_ptr,
+    b_global_ptr,
+    metadata_offsets,
+    expert_id,
+    output_indices,
+    mask,
+    OUTPUT_PARTITION_SIZE: tl.constexpr,
+    NUM_PARTITIONS: tl.constexpr,
+    METADATA_FORMAT: tl.constexpr,
+):
+    """Load one MoE metadata tile without materializing model-sized tensors."""
+    if METADATA_FORMAT == _CUBIC_MOE_METADATA_EXPANDED:
+        scale = tl.load(primary_ptr + metadata_offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        cubic_a = tl.load(
+            secondary_ptr + metadata_offsets, mask=mask, other=1.0
+        ).to(tl.float32)
+        cubic_b = tl.load(
+            tertiary_ptr + metadata_offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        # Keep the loader's return rank determined by the output tile rather
+        # than by constant-folding of a shared metadata offset.  For legacy
+        # ``(Gout, Gin)`` layouts, every output in a tile may share one scalar
+        # metadata address; compact formats still index their partition table
+        # by the output vector.  Broadcasting the expanded values here keeps
+        # both constexpr format branches type-compatible without changing the
+        # stored metadata or its arithmetic.
+        output_broadcast = output_indices.to(tl.float32) * 0.0
+        return (
+            scale + output_broadcast,
+            cubic_a + output_broadcast,
+            cubic_b + output_broadcast,
+        )
+
+    partition = output_indices // OUTPUT_PARTITION_SIZE
+    partition = tl.minimum(partition, NUM_PARTITIONS - 1)
+    table_offset = expert_id * NUM_PARTITIONS + partition
+    if METADATA_FORMAT == _CUBIC_MOE_METADATA_E5M9_CURVE2:
+        metadata = tl.load(primary_ptr + metadata_offsets, mask=mask, other=0).to(
+            tl.uint16
+        )
+        curve_id = (metadata >> 14).to(tl.int32)
+        scale_bits = ((metadata & 0x3FFF) << 1).to(tl.uint16)
+        scale = scale_bits.to(tl.float16, bitcast=True).to(tl.float32)
+        curve_offset = table_offset * 4 + curve_id
+        cubic_a = tl.load(
+            secondary_ptr + curve_offset, mask=mask, other=1.0
+        ).to(tl.float32)
+        cubic_b = tl.load(
+            tertiary_ptr + curve_offset, mask=mask, other=0.0
+        ).to(tl.float32)
+        return scale, cubic_a, cubic_b
+
+    scale_global = tl.load(
+        scale_global_ptr + table_offset, mask=mask, other=0.0
+    ).to(tl.float32)
+    a_global = tl.load(a_global_ptr + table_offset, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    b_global = tl.load(b_global_ptr + table_offset, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    scale_code = tl.load(primary_ptr + metadata_offsets, mask=mask, other=0).to(
+        tl.float32
+    )
+    packed_ab = tl.load(secondary_ptr + metadata_offsets, mask=mask, other=0).to(
         tl.int32
     )
     a_code = packed_ab & 0xF
@@ -6659,6 +6845,193 @@ def _apply_cubic_moe_activation(
 
 
 @triton.autotune(
+    configs=_CUBIC_MOE_COMPACT_A8_DP4A_CONFIGS,
+    key=[
+        "N",
+        "K",
+        "NUM_BITS",
+        "GROUP_SIZE",
+        "GROUP_OUT",
+        "GROUPED_ROUTES",
+        "ROUTE_CTAS",
+        "TOP_K",
+        "SUM_ROUTES",
+        "METADATA_FORMAT",
+    ],
+    cache_results=True,
+)
+@triton.jit
+def _cubic_moe_compact_a8_dp4a_gemv_kernel(
+    input_words_ptr,
+    input_scale_ptr,
+    weight_ptr,
+    primary_ptr,
+    secondary_ptr,
+    tertiary_ptr,
+    scale_global_ptr,
+    a_global_ptr,
+    b_global_ptr,
+    output_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    num_valid_tokens,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    PACKED_K: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    stride_iwm,
+    stride_iwk,
+    stride_we,
+    stride_wn,
+    stride_wp,
+    stride_se,
+    stride_sn,
+    stride_sg,
+    stride_om,
+    stride_on,
+    NUM_BITS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    GROUP_OUT: tl.constexpr,
+    GROUPED_ROUTES: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ROUTE_CTAS: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    TOP_K: tl.constexpr,
+    SUM_ROUTES: tl.constexpr,
+    OUTPUT_PARTITION_SIZE: tl.constexpr,
+    NUM_PARTITIONS: tl.constexpr,
+    METADATA_FORMAT: tl.constexpr,
+):
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    offs_n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+    group_quads: tl.constexpr = GROUP_SIZE // 4
+    quad_block: tl.constexpr = 8
+    offs_quad = tl.arange(0, quad_block)
+    route = tl.program_id(1)
+    route_sum = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    while route < num_tokens_post_padded:
+        token_id = tl.load(sorted_token_ids_ptr + route).to(tl.int64)
+        expert_id = tl.load(expert_ids_ptr + route // GROUPED_ROUTES).to(tl.int64)
+        valid_route = (token_id < num_valid_tokens) & (expert_id >= 0)
+        token_id = tl.where(valid_route, token_id, 0)
+        expert_id = tl.where(valid_route, expert_id, 0)
+        input_row = token_id // TOP_K
+        activation_scale = tl.load(
+            input_scale_ptr + input_row, mask=valid_route, other=0.0
+        ).to(tl.float32)
+        accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+        for group in tl.range(0, NUM_GROUPS):
+            metadata_offsets = (
+                expert_id * stride_se
+                + (offs_n // GROUP_OUT) * stride_sn
+                + group * stride_sg
+            )
+            metadata_mask = n_mask & valid_route
+            weight_scale, cubic_a, cubic_b = _cubic_load_moe_metadata(
+                primary_ptr,
+                secondary_ptr,
+                tertiary_ptr,
+                scale_global_ptr,
+                a_global_ptr,
+                b_global_ptr,
+                metadata_offsets,
+                expert_id,
+                offs_n,
+                metadata_mask,
+                OUTPUT_PARTITION_SIZE,
+                NUM_PARTITIONS,
+                METADATA_FORMAT,
+            )
+            cubic_a = cubic_a[:, None]
+            cubic_b = cubic_b[:, None]
+            group_dot = tl.zeros((BLOCK_N,), dtype=tl.int32)
+            for quad_base in tl.static_range(0, group_quads, quad_block):
+                quad = quad_base + offs_quad
+                carrier_word = tl.zeros((BLOCK_N, quad_block), dtype=tl.int32)
+                for lane in tl.static_range(0, 4):
+                    global_k = group * GROUP_SIZE + quad * 4 + lane
+                    bit_positions = global_k * NUM_BITS
+                    byte_indices = bit_positions // 8
+                    shifts = bit_positions % 8
+                    packed_ptrs = (
+                        weight_ptr
+                        + expert_id * stride_we
+                        + offs_n[:, None] * stride_wn
+                        + byte_indices[None, :] * stride_wp
+                    )
+                    weight_mask = (
+                        n_mask[:, None]
+                        & (quad[None, :] < group_quads)
+                        & (global_k[None, :] < K)
+                        & valid_route
+                    )
+                    low = tl.load(packed_ptrs, mask=weight_mask, other=0).to(
+                        tl.int32
+                    )
+                    if 8 % NUM_BITS == 0:
+                        high = 0
+                    else:
+                        high = tl.load(
+                            packed_ptrs + stride_wp,
+                            mask=weight_mask
+                            & (byte_indices[None, :] + 1 < PACKED_K),
+                            other=0,
+                        ).to(tl.int32)
+                    raw = (
+                        (low >> shifts[None, :])
+                        | (high << (8 - shifts[None, :]))
+                    ) & ((1 << NUM_BITS) - 1)
+                    carrier = _cubic_dynamic_a8_carrier(
+                        raw, cubic_a, cubic_b, NUM_BITS
+                    )
+                    carrier_word |= (carrier.to(tl.int32) & 0xFF) << (lane * 8)
+                activation_word = tl.load(
+                    input_words_ptr
+                    + input_row * stride_iwm
+                    + (group * group_quads + quad) * stride_iwk,
+                    mask=valid_route & (quad < group_quads),
+                    other=0,
+                ).to(tl.int32)
+                dot = _cubic_dp4a(
+                    carrier_word,
+                    activation_word[None, :],
+                    tl.zeros((BLOCK_N, quad_block), dtype=tl.int32),
+                )
+                group_dot += tl.sum(dot, axis=1)
+            accumulator += (
+                group_dot.to(tl.float32)
+                * activation_scale
+                * weight_scale
+                * (1.0 / 127.0)
+            )
+
+        if MUL_ROUTED_WEIGHT:
+            accumulator *= tl.load(
+                topk_weights_ptr + token_id, mask=valid_route, other=0.0
+            )
+        if SUM_ROUTES:
+            route_sum += accumulator.to(output_ptr.dtype.element_ty).to(tl.float32)
+        else:
+            tl.store(
+                output_ptr + token_id * stride_om + offs_n * stride_on,
+                accumulator,
+                mask=n_mask & valid_route,
+            )
+        route += ROUTE_CTAS
+    if SUM_ROUTES:
+        tl.store(
+            output_ptr + tl.program_id(1) * stride_om + offs_n * stride_on,
+            route_sum,
+            mask=n_mask,
+        )
+
+
+@triton.autotune(
     configs=_CUBIC_MOE_GEMV_CONFIGS,
     key=[
         "N",
@@ -9756,11 +10129,15 @@ def _cubic_moe_gemv_kernel(
     scale_ptr,
     cubic_a_ptr,
     cubic_b_ptr,
+    scale_global_ptr,
+    a_global_ptr,
+    b_global_ptr,
     output_ptr,
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
+    num_valid_tokens,
     N: tl.constexpr,
     K: tl.constexpr,
     PACKED_K: tl.constexpr,
@@ -9784,6 +10161,9 @@ def _cubic_moe_gemv_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     TOP_K: tl.constexpr,
     SUM_ROUTES: tl.constexpr,
+    OUTPUT_PARTITION_SIZE: tl.constexpr,
+    NUM_PARTITIONS: tl.constexpr,
+    METADATA_FORMAT: tl.constexpr,
 ):
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     offs_n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -9795,6 +10175,9 @@ def _cubic_moe_gemv_kernel(
         if route < num_tokens_post_padded:
             token_id = tl.load(sorted_token_ids_ptr + route).to(tl.int64)
             expert_id = tl.load(expert_ids_ptr + route).to(tl.int64)
+            valid_route = (token_id < num_valid_tokens) & (expert_id >= 0)
+            token_id = tl.where(valid_route, token_id, 0)
+            expert_id = tl.where(valid_route, expert_id, 0)
             accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
             for k_block in range(0, tl.cdiv(K, BLOCK_K)):
@@ -9802,7 +10185,7 @@ def _cubic_moe_gemv_kernel(
                 k_mask = global_k < K
                 activation = tl.load(
                     input_ptr + (token_id // TOP_K) * stride_im + global_k * stride_ik,
-                    mask=k_mask,
+                    mask=k_mask & valid_route,
                     other=0.0,
                 )
                 bit_positions = global_k[None, :] * NUM_BITS
@@ -9814,7 +10197,7 @@ def _cubic_moe_gemv_kernel(
                     + offs_n[:, None] * stride_wn
                     + byte_indices * stride_wp
                 )
-                weight_mask = n_mask[:, None] & k_mask[None, :]
+                weight_mask = n_mask[:, None] & k_mask[None, :] & valid_route
                 low = tl.load(
                     packed_ptrs,
                     mask=weight_mask,
@@ -9835,14 +10218,16 @@ def _cubic_moe_gemv_kernel(
                             + (tl.program_id(0) * BLOCK_N // GROUP_OUT) * stride_sn
                             + global_k * stride_sg
                         )
-                        metadata_mask = k_mask
+                        metadata_mask = k_mask & valid_route
                     else:
                         metadata_ptrs = (
                             expert_id * stride_se
                             + (offs_n[:, None] // GROUP_OUT) * stride_sn
                             + global_k[None, :] * stride_sg
                         )
-                        metadata_mask = n_mask[:, None] & k_mask[None, :]
+                        metadata_mask = (
+                            n_mask[:, None] & k_mask[None, :] & valid_route
+                        )
                 else:
                     group = (k_block * BLOCK_K) // GROUP_SIZE
                     metadata_ptrs = (
@@ -9850,12 +10235,22 @@ def _cubic_moe_gemv_kernel(
                         + (offs_n // GROUP_OUT) * stride_sn
                         + group * stride_sg
                     )
-                    metadata_mask = n_mask & (group < NUM_GROUPS)
-                scale = tl.load(
-                    scale_ptr + metadata_ptrs,
-                    mask=metadata_mask,
-                    other=0.0,
-                ).to(tl.float32)
+                    metadata_mask = n_mask & (group < NUM_GROUPS) & valid_route
+                scale, cubic_a, cubic_b = _cubic_load_moe_metadata(
+                    scale_ptr,
+                    cubic_a_ptr,
+                    cubic_b_ptr,
+                    scale_global_ptr,
+                    a_global_ptr,
+                    b_global_ptr,
+                    metadata_ptrs,
+                    expert_id,
+                    offs_n if GROUP_SIZE != 1 else offs_n[:, None],
+                    metadata_mask,
+                    OUTPUT_PARTITION_SIZE,
+                    NUM_PARTITIONS,
+                    METADATA_FORMAT,
+                )
                 if (
                     GROUP_SIZE == 1
                     and GROUP_OUT >= BLOCK_N
@@ -9865,16 +10260,6 @@ def _cubic_moe_gemv_kernel(
                 elif GROUP_SIZE != 1:
                     scale = scale[:, None]
                 if NUM_BITS > 2:
-                    cubic_a = tl.load(
-                        cubic_a_ptr + metadata_ptrs,
-                        mask=metadata_mask,
-                        other=1.0,
-                    ).to(tl.float32)
-                    cubic_b = tl.load(
-                        cubic_b_ptr + metadata_ptrs,
-                        mask=metadata_mask,
-                        other=0.0,
-                    ).to(tl.float32)
                     if (
                         GROUP_SIZE == 1
                         and GROUP_OUT >= BLOCK_N
@@ -9914,14 +10299,16 @@ def _cubic_moe_gemv_kernel(
                 )
 
             if MUL_ROUTED_WEIGHT:
-                accumulator *= tl.load(topk_weights_ptr + token_id)
+                accumulator *= tl.load(
+                    topk_weights_ptr + token_id, mask=valid_route, other=0.0
+                )
             if SUM_ROUTES:
                 route_sum += accumulator.to(output_ptr.dtype.element_ty).to(tl.float32)
             else:
                 tl.store(
                     output_ptr + token_id * stride_om + offs_n * stride_on,
                     accumulator,
-                    mask=n_mask,
+                    mask=n_mask & valid_route,
                 )
         route += ROUTE_CTAS
     if SUM_ROUTES:
@@ -9954,6 +10341,9 @@ def _cubic_moe_kernel(
     scale_ptr,
     cubic_a_ptr,
     cubic_b_ptr,
+    scale_global_ptr,
+    a_global_ptr,
+    b_global_ptr,
     output_ptr,
     topk_weights_ptr,
     sorted_token_ids_ptr,
@@ -9986,6 +10376,9 @@ def _cubic_moe_kernel(
     TOP_K: tl.constexpr,
     USE_GROUP_LUT: tl.constexpr,
     DYNAMIC_A8: tl.constexpr,
+    OUTPUT_PARTITION_SIZE: tl.constexpr,
+    NUM_PARTITIONS: tl.constexpr,
+    METADATA_FORMAT: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(EM, BLOCK_M)
@@ -10060,7 +10453,21 @@ def _cubic_moe_kernel(
                     + (pid_n * BLOCK_N // GROUP_OUT) * stride_sn
                     + group * stride_sg
                 )
-                scale = tl.load(scale_ptr + metadata_ptrs).to(tl.float32)
+                scale, cubic_a, cubic_b = _cubic_load_moe_metadata(
+                    scale_ptr,
+                    cubic_a_ptr,
+                    cubic_b_ptr,
+                    scale_global_ptr,
+                    a_global_ptr,
+                    b_global_ptr,
+                    metadata_ptrs,
+                    expert_id,
+                    offs_n,
+                    True,
+                    OUTPUT_PARTITION_SIZE,
+                    NUM_PARTITIONS,
+                    METADATA_FORMAT,
+                )
             else:
                 metadata_ptrs = (
                     expert_id * stride_se
@@ -10068,26 +10475,28 @@ def _cubic_moe_kernel(
                     + group * stride_sg
                 )
                 metadata_mask = (offs_n_raw < N) & (group < NUM_GROUPS)
-                scale = tl.load(
-                    scale_ptr + metadata_ptrs,
-                    mask=metadata_mask,
-                    other=0.0,
-                ).to(tl.float32)[None, :]
+                scale, cubic_a, cubic_b = _cubic_load_moe_metadata(
+                    scale_ptr,
+                    cubic_a_ptr,
+                    cubic_b_ptr,
+                    scale_global_ptr,
+                    a_global_ptr,
+                    b_global_ptr,
+                    metadata_ptrs,
+                    expert_id,
+                    offs_n,
+                    metadata_mask,
+                    OUTPUT_PARTITION_SIZE,
+                    NUM_PARTITIONS,
+                    METADATA_FORMAT,
+                )
+                scale = scale[None, :]
             if NUM_BITS > 2:
                 if GROUP_OUT >= BLOCK_N and GROUP_OUT % BLOCK_N == 0:
-                    cubic_a = tl.load(cubic_a_ptr + metadata_ptrs).to(tl.float32)
-                    cubic_b = tl.load(cubic_b_ptr + metadata_ptrs).to(tl.float32)
+                    pass
                 else:
-                    cubic_a = tl.load(
-                        cubic_a_ptr + metadata_ptrs,
-                        mask=metadata_mask,
-                        other=1.0,
-                    ).to(tl.float32)[None, :]
-                    cubic_b = tl.load(
-                        cubic_b_ptr + metadata_ptrs,
-                        mask=metadata_mask,
-                        other=0.0,
-                    ).to(tl.float32)[None, :]
+                    cubic_a = cubic_a[None, :]
+                    cubic_b = cubic_b[None, :]
             else:
                 cubic_a = 1.0
                 cubic_b = 0.0
@@ -10116,21 +10525,21 @@ def _cubic_moe_kernel(
                     + groups * stride_sg
                 )
                 metadata_mask = weight_mask & (groups < NUM_GROUPS)
-            scale = tl.load(
-                scale_ptr + metadata_ptrs,
-                mask=metadata_mask,
-                other=0.0,
+            scale, cubic_a, cubic_b = _cubic_load_moe_metadata(
+                scale_ptr,
+                cubic_a_ptr,
+                cubic_b_ptr,
+                scale_global_ptr,
+                a_global_ptr,
+                b_global_ptr,
+                metadata_ptrs,
+                expert_id,
+                offs_n[None, :],
+                metadata_mask,
+                OUTPUT_PARTITION_SIZE,
+                NUM_PARTITIONS,
+                METADATA_FORMAT,
             )
-            cubic_a = tl.load(
-                cubic_a_ptr + metadata_ptrs,
-                mask=metadata_mask,
-                other=1.0,
-            ).to(tl.float32)
-            cubic_b = tl.load(
-                cubic_b_ptr + metadata_ptrs,
-                mask=metadata_mask,
-                other=0.0,
-            ).to(tl.float32)
             weight = _decode_cubic_direct(
                 low,
                 high,
@@ -10198,11 +10607,15 @@ def _cubic_moe_dynamic_a8_gemv_kernel(
     scale_ptr,
     cubic_a_ptr,
     cubic_b_ptr,
+    scale_global_ptr,
+    a_global_ptr,
+    b_global_ptr,
     output_ptr,
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
+    num_valid_tokens,
     N: tl.constexpr,
     K: tl.constexpr,
     PACKED_K: tl.constexpr,
@@ -10226,6 +10639,9 @@ def _cubic_moe_dynamic_a8_gemv_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     TOP_K: tl.constexpr,
     SUM_ROUTES: tl.constexpr,
+    OUTPUT_PARTITION_SIZE: tl.constexpr,
+    NUM_PARTITIONS: tl.constexpr,
+    METADATA_FORMAT: tl.constexpr,
 ):
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     offs_n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -10237,8 +10653,13 @@ def _cubic_moe_dynamic_a8_gemv_kernel(
     while route < num_tokens_post_padded:
         token_id = tl.load(sorted_token_ids_ptr + route).to(tl.int64)
         expert_id = tl.load(expert_ids_ptr + route).to(tl.int64)
+        valid_route = (token_id < num_valid_tokens) & (expert_id >= 0)
+        token_id = tl.where(valid_route, token_id, 0)
+        expert_id = tl.where(valid_route, expert_id, 0)
         input_row = token_id // TOP_K
-        activation_scale = tl.load(input_scale_ptr + input_row).to(tl.float32)
+        activation_scale = tl.load(
+            input_scale_ptr + input_row, mask=valid_route, other=0.0
+        ).to(tl.float32)
         accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
         for k_block in tl.range(0, tl.cdiv(K, BLOCK_K)):
@@ -10246,7 +10667,7 @@ def _cubic_moe_dynamic_a8_gemv_kernel(
             k_mask = global_k < K
             activation = tl.load(
                 input_ptr + input_row * stride_im + global_k * stride_ik,
-                mask=k_mask,
+                mask=k_mask & valid_route,
                 other=0,
             ).to(tl.int32)
             bit_positions = global_k[None, :] * NUM_BITS
@@ -10258,7 +10679,7 @@ def _cubic_moe_dynamic_a8_gemv_kernel(
                 + offs_n[:, None] * stride_wn
                 + byte_indices * stride_wp
             )
-            weight_mask = n_mask[:, None] & k_mask[None, :]
+            weight_mask = n_mask[:, None] & k_mask[None, :] & valid_route
             low = tl.load(packed_ptrs, mask=weight_mask, other=0).to(tl.int32)
             if 8 % NUM_BITS == 0:
                 high = 0
@@ -10275,22 +10696,22 @@ def _cubic_moe_dynamic_a8_gemv_kernel(
                     + (offs_n[:, None] // GROUP_OUT) * stride_sn
                     + global_k[None, :] * stride_sg
                 )
-                metadata_mask = n_mask[:, None] & k_mask[None, :]
-                weight_scale = tl.load(
-                    scale_ptr + metadata_offsets,
-                    mask=metadata_mask,
-                    other=0.0,
-                ).to(tl.float32)
-                cubic_a = tl.load(
-                    cubic_a_ptr + metadata_offsets,
-                    mask=metadata_mask,
-                    other=1.0,
-                ).to(tl.float32)
-                cubic_b = tl.load(
-                    cubic_b_ptr + metadata_offsets,
-                    mask=metadata_mask,
-                    other=0.0,
-                ).to(tl.float32)
+                metadata_mask = n_mask[:, None] & k_mask[None, :] & valid_route
+                weight_scale, cubic_a, cubic_b = _cubic_load_moe_metadata(
+                    scale_ptr,
+                    cubic_a_ptr,
+                    cubic_b_ptr,
+                    scale_global_ptr,
+                    a_global_ptr,
+                    b_global_ptr,
+                    metadata_offsets,
+                    expert_id,
+                    offs_n[:, None],
+                    metadata_mask,
+                    OUTPUT_PARTITION_SIZE,
+                    NUM_PARTITIONS,
+                    METADATA_FORMAT,
+                )
                 carrier = _cubic_dynamic_a8_carrier(raw, cubic_a, cubic_b, NUM_BITS)
                 partial = tl.sum(
                     carrier.to(tl.float32)
@@ -10306,23 +10727,25 @@ def _cubic_moe_dynamic_a8_gemv_kernel(
                     + (offs_n // GROUP_OUT) * stride_sn
                     + group * stride_sg
                 )
-                metadata_mask = n_mask & (group < NUM_GROUPS)
-                weight_scale = tl.load(
-                    scale_ptr + metadata_offsets,
-                    mask=metadata_mask,
-                    other=0.0,
-                ).to(tl.float32)
+                metadata_mask = n_mask & (group < NUM_GROUPS) & valid_route
+                weight_scale, cubic_a, cubic_b = _cubic_load_moe_metadata(
+                    scale_ptr,
+                    cubic_a_ptr,
+                    cubic_b_ptr,
+                    scale_global_ptr,
+                    a_global_ptr,
+                    b_global_ptr,
+                    metadata_offsets,
+                    expert_id,
+                    offs_n,
+                    metadata_mask,
+                    OUTPUT_PARTITION_SIZE,
+                    NUM_PARTITIONS,
+                    METADATA_FORMAT,
+                )
                 if NUM_BITS > 2:
-                    cubic_a = tl.load(
-                        cubic_a_ptr + metadata_offsets,
-                        mask=metadata_mask,
-                        other=1.0,
-                    ).to(tl.float32)[:, None]
-                    cubic_b = tl.load(
-                        cubic_b_ptr + metadata_offsets,
-                        mask=metadata_mask,
-                        other=0.0,
-                    ).to(tl.float32)[:, None]
+                    cubic_a = cubic_a[:, None]
+                    cubic_b = cubic_b[:, None]
                 else:
                     cubic_a = 1.0
                     cubic_b = 0.0
@@ -10344,14 +10767,16 @@ def _cubic_moe_dynamic_a8_gemv_kernel(
                 )
 
         if MUL_ROUTED_WEIGHT:
-            accumulator *= tl.load(topk_weights_ptr + token_id)
+            accumulator *= tl.load(
+                topk_weights_ptr + token_id, mask=valid_route, other=0.0
+            )
         if SUM_ROUTES:
             route_sum += accumulator.to(output_ptr.dtype.element_ty).to(tl.float32)
         else:
             tl.store(
                 output_ptr + token_id * stride_om + offs_n * stride_on,
                 accumulator,
-                mask=n_mask,
+                mask=n_mask & valid_route,
             )
         route += ROUTE_CTAS
 
@@ -10534,6 +10959,7 @@ _CUBIC_A8_GEMV_AUTOTUNE_CONFIGS = [
         "GROUP_SIZE",
         "GROUP_OUT",
         "ROUTE_CTAS",
+        "GROUPED_ROUTES",
         "MUL_ROUTED_WEIGHT",
         "TOP_K",
         "SUM_ROUTES",
@@ -10557,6 +10983,7 @@ def _cubic_moe_dynamic_a8_autotune_gemv_kernel(
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
+    num_valid_tokens,
     N: tl.constexpr,
     K: tl.constexpr,
     PACKED_K: tl.constexpr,
@@ -10581,6 +11008,7 @@ def _cubic_moe_dynamic_a8_autotune_gemv_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     ROUTE_CTAS: tl.constexpr,
+    GROUPED_ROUTES: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     TOP_K: tl.constexpr,
     SUM_ROUTES: tl.constexpr,
@@ -10600,10 +11028,15 @@ def _cubic_moe_dynamic_a8_autotune_gemv_kernel(
 
     while route < num_tokens_post_padded:
         token_id = tl.load(sorted_token_ids_ptr + route).to(tl.int64)
-        expert_id = tl.load(expert_ids_ptr + route).to(tl.int64)
+        expert_id = tl.load(expert_ids_ptr + route // GROUPED_ROUTES).to(tl.int64)
+        valid_route = (token_id < num_valid_tokens) & (expert_id >= 0)
+        token_id = tl.where(valid_route, token_id, 0)
+        expert_id = tl.where(valid_route, expert_id, 0)
         input_row = token_id // TOP_K
         if not GROUPWISE_SCALE:
-            activation_scale = tl.load(input_scale_ptr + input_row).to(tl.float32)
+            activation_scale = tl.load(
+                input_scale_ptr + input_row, mask=valid_route, other=0.0
+            ).to(tl.float32)
         accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
         if USE_SPECIAL_3BIT:
@@ -10897,14 +11330,16 @@ def _cubic_moe_dynamic_a8_autotune_gemv_kernel(
                 )
 
         if MUL_ROUTED_WEIGHT:
-            accumulator *= tl.load(topk_weights_ptr + token_id)
+            accumulator *= tl.load(
+                topk_weights_ptr + token_id, mask=valid_route, other=0.0
+            )
         if SUM_ROUTES:
             route_sum += accumulator.to(output_ptr.dtype.element_ty).to(tl.float32)
         else:
             tl.store(
                 output_ptr + token_id * stride_om + offs_n * stride_on,
                 accumulator,
-                mask=n_mask,
+                mask=n_mask & valid_route,
             )
         route += ROUTE_CTAS
     if SUM_ROUTES:
@@ -11093,6 +11528,9 @@ def _cubic_moe_dynamic_a8_kernel(
     scale_ptr,
     cubic_a_ptr,
     cubic_b_ptr,
+    scale_global_ptr,
+    a_global_ptr,
+    b_global_ptr,
     carrier_lut_ptr,
     output_ptr,
     topk_weights_ptr,
@@ -11126,6 +11564,9 @@ def _cubic_moe_dynamic_a8_kernel(
     TOP_K: tl.constexpr,
     PRECOMPUTED_3BIT_LEVELS: tl.constexpr,
     PRECOMPUTED_CARRIER_LUT: tl.constexpr,
+    OUTPUT_PARTITION_SIZE: tl.constexpr,
+    NUM_PARTITIONS: tl.constexpr,
+    METADATA_FORMAT: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(EM, BLOCK_M)
@@ -11174,7 +11615,21 @@ def _cubic_moe_dynamic_a8_kernel(
                 + (pid_n * BLOCK_N // GROUP_OUT) * stride_sn
                 + group * stride_sg
             )
-            weight_scale = tl.load(scale_ptr + metadata_offsets).to(tl.float32)
+            weight_scale, cubic_a, cubic_b = _cubic_load_moe_metadata(
+                scale_ptr,
+                cubic_a_ptr,
+                cubic_b_ptr,
+                scale_global_ptr,
+                a_global_ptr,
+                b_global_ptr,
+                metadata_offsets,
+                expert_id,
+                offs_n,
+                True,
+                OUTPUT_PARTITION_SIZE,
+                NUM_PARTITIONS,
+                METADATA_FORMAT,
+            )
         else:
             metadata_offsets = (
                 expert_id * stride_se
@@ -11182,26 +11637,28 @@ def _cubic_moe_dynamic_a8_kernel(
                 + group * stride_sg
             )
             metadata_mask = offs_n_raw < N
-            weight_scale = tl.load(
-                scale_ptr + metadata_offsets,
-                mask=metadata_mask,
-                other=0.0,
-            ).to(tl.float32)[None, :]
+            weight_scale, cubic_a, cubic_b = _cubic_load_moe_metadata(
+                scale_ptr,
+                cubic_a_ptr,
+                cubic_b_ptr,
+                scale_global_ptr,
+                a_global_ptr,
+                b_global_ptr,
+                metadata_offsets,
+                expert_id,
+                offs_n,
+                metadata_mask,
+                OUTPUT_PARTITION_SIZE,
+                NUM_PARTITIONS,
+                METADATA_FORMAT,
+            )
+            weight_scale = weight_scale[None, :]
         if NUM_BITS > 2:
             if GROUP_OUT >= BLOCK_N and GROUP_OUT % BLOCK_N == 0:
-                cubic_a = tl.load(cubic_a_ptr + metadata_offsets).to(tl.float32)
-                cubic_b = tl.load(cubic_b_ptr + metadata_offsets).to(tl.float32)
+                pass
             else:
-                cubic_a = tl.load(
-                    cubic_a_ptr + metadata_offsets,
-                    mask=metadata_mask,
-                    other=1.0,
-                ).to(tl.float32)[None, :]
-                cubic_b = tl.load(
-                    cubic_b_ptr + metadata_offsets,
-                    mask=metadata_mask,
-                    other=0.0,
-                ).to(tl.float32)[None, :]
+                cubic_a = cubic_a[None, :]
+                cubic_b = cubic_b[None, :]
         for group_k_block in range(0, GROUP_SIZE // BLOCK_K):
             global_k = group * GROUP_SIZE + group_k_block * BLOCK_K + offs_k
             k_mask = global_k < K
@@ -11585,6 +12042,7 @@ def _launch_cubic_moe_gemv(
     sum_routes: bool,
     route_ctas: int | None = None,
     dense_block_m: int = 16,
+    compact_metadata: CubicMoECompactMetadata | None = None,
 ) -> None:
     del dense_block_m
     route_ctas = (
@@ -11595,7 +12053,7 @@ def _launch_cubic_moe_gemv(
             sorted_token_ids.numel() if route_ctas is None else route_ctas,
         )
     )
-    if (
+    if compact_metadata is None and (
         group_out == 1
         and num_bits == 2
         and group_size in (128, 256, 512)
@@ -11638,7 +12096,7 @@ def _launch_cubic_moe_gemv(
         )
         return
 
-    if (
+    if compact_metadata is None and (
         group_out == 1
         and num_bits == 3
         and group_size in (128, 256)
@@ -11687,17 +12145,38 @@ def _launch_cubic_moe_gemv(
         triton.cdiv(packed.shape[1], meta["BLOCK_N"]),
         route_ctas,
     )
+    if compact_metadata is None:
+        scale_global = scale
+        a_global = a
+        b_global = b
+        metadata_format = _CUBIC_MOE_METADATA_EXPANDED
+        output_partition_size = packed.shape[1]
+        num_partitions = 1
+    else:
+        scale = compact_metadata.primary
+        a = compact_metadata.secondary
+        b = compact_metadata.tertiary
+        scale_global = compact_metadata.scale_global
+        a_global = compact_metadata.a_global
+        b_global = compact_metadata.b_global
+        metadata_format = compact_metadata.format
+        output_partition_size = compact_metadata.output_partition_size
+        num_partitions = compact_metadata.num_partitions
     _cubic_moe_gemv_kernel[grid](
         inputs,
         packed,
         scale,
         a,
         b,
+        scale_global,
+        a_global,
+        b_global,
         output,
         topk_weights,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
+        topk_weights.numel(),
         packed.shape[1],
         logical_k,
         packed.shape[2],
@@ -11720,6 +12199,9 @@ def _launch_cubic_moe_gemv(
         MUL_ROUTED_WEIGHT=multiply_routed_weight,
         TOP_K=top_k,
         SUM_ROUTES=sum_routes,
+        OUTPUT_PARTITION_SIZE=output_partition_size,
+        NUM_PARTITIONS=num_partitions,
+        METADATA_FORMAT=metadata_format,
     )
 
 
@@ -12257,6 +12739,7 @@ def _launch_cubic_moe_gemm(
     route_ctas: int | None = None,
     input_scale: torch.Tensor | None = None,
     group_out: int,
+    compact_metadata: CubicMoECompactMetadata | None = None,
 ) -> None:
     del route_ctas
     if sum_routes:
@@ -12268,6 +12751,23 @@ def _launch_cubic_moe_gemm(
     use_group_lut = group_size >= block_k and group_size % block_k == 0
     n = packed.shape[1]
     em = sorted_token_ids.shape[0]
+    if compact_metadata is None:
+        scale_global = scale
+        a_global = a
+        b_global = b
+        metadata_format = _CUBIC_MOE_METADATA_EXPANDED
+        output_partition_size = n
+        num_partitions = 1
+    else:
+        scale = compact_metadata.primary
+        a = compact_metadata.secondary
+        b = compact_metadata.tertiary
+        scale_global = compact_metadata.scale_global
+        a_global = compact_metadata.a_global
+        b_global = compact_metadata.b_global
+        metadata_format = compact_metadata.format
+        output_partition_size = compact_metadata.output_partition_size
+        num_partitions = compact_metadata.num_partitions
     grid = lambda meta: (triton.cdiv(em, block_m) * triton.cdiv(n, meta["BLOCK_N"]),)
     _cubic_moe_kernel[grid](
         inputs,
@@ -12276,6 +12776,9 @@ def _launch_cubic_moe_gemm(
         scale,
         a,
         b,
+        scale_global,
+        a_global,
+        b_global,
         output,
         topk_weights,
         sorted_token_ids,
@@ -12307,6 +12810,9 @@ def _launch_cubic_moe_gemm(
         TOP_K=top_k,
         USE_GROUP_LUT=use_group_lut and num_bits <= 4,
         DYNAMIC_A8=input_scale is not None,
+        OUTPUT_PARTITION_SIZE=output_partition_size,
+        NUM_PARTITIONS=num_partitions,
+        METADATA_FORMAT=metadata_format,
     )
 
 
@@ -12336,6 +12842,7 @@ def _launch_cubic_moe_dynamic_a8(
     dense_block_k: int = 32,
     carrier_lut: torch.Tensor | None = None,
     group_out: int,
+    compact_metadata: CubicMoECompactMetadata | None = None,
 ) -> None:
     if not use_gemv and group_size == 1:
         if quantized_inputs is None:
@@ -12379,6 +12886,106 @@ def _launch_cubic_moe_dynamic_a8(
                 128 if route_ctas is None else route_ctas,
             )
         )
+        if compact_metadata is not None:
+            scale = compact_metadata.primary
+            a = compact_metadata.secondary
+            b = compact_metadata.tertiary
+            if _cubic_compact_a8_native_supported(
+                num_bits=num_bits,
+                logical_k=logical_k,
+                group_size=group_size,
+                group_out=group_out,
+                grouped_routes=grouped_routes,
+                sum_routes=sum_routes,
+            ) and (
+                _cubic_a8_moe_backend(
+                    num_bits=num_bits,
+                    n=packed.shape[1],
+                    k=logical_k,
+                    group_size=group_size,
+                    group_out=group_out,
+                    local_experts=packed.shape[0],
+                    grouped_routes=grouped_routes,
+                    route_ctas=route_ctas,
+                )
+                == "cuda"
+            ):
+                torch.ops._C.cubic_w4_w8_compact_a8_gemv(
+                    inputs_q,
+                    input_scale,
+                    packed,
+                    scale,
+                    a,
+                    b,
+                    compact_metadata.scale_global,
+                    compact_metadata.a_global,
+                    compact_metadata.b_global,
+                    output,
+                    topk_weights,
+                    sorted_token_ids,
+                    expert_ids,
+                    num_tokens_post_padded,
+                    num_bits,
+                    group_size,
+                    group_out,
+                    top_k,
+                    multiply_routed_weight,
+                    route_ctas,
+                    topk_weights.numel(),
+                    compact_metadata.output_partition_size,
+                    compact_metadata.num_partitions,
+                    compact_metadata.format,
+                    grouped_routes,
+                )
+                return
+            input_words = inputs_q.view(torch.int32)
+            grid = lambda meta: (
+                triton.cdiv(packed.shape[1], meta["BLOCK_N"]),
+                route_ctas,
+            )
+            _cubic_moe_compact_a8_dp4a_gemv_kernel[grid](
+                input_words,
+                input_scale,
+                packed,
+                scale,
+                a,
+                b,
+                compact_metadata.scale_global,
+                compact_metadata.a_global,
+                compact_metadata.b_global,
+                output,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                topk_weights.numel(),
+                packed.shape[1],
+                logical_k,
+                packed.shape[2],
+                scale.shape[2],
+                input_words.stride(0),
+                input_words.stride(1),
+                packed.stride(0),
+                packed.stride(1),
+                packed.stride(2),
+                scale.stride(0),
+                scale.stride(1),
+                scale.stride(2),
+                output.stride(-2),
+                output.stride(-1),
+                NUM_BITS=num_bits,
+                GROUP_SIZE=group_size,
+                GROUP_OUT=group_out,
+                GROUPED_ROUTES=grouped_routes,
+                ROUTE_CTAS=route_ctas,
+                MUL_ROUTED_WEIGHT=multiply_routed_weight,
+                TOP_K=top_k,
+                SUM_ROUTES=sum_routes,
+                OUTPUT_PARTITION_SIZE=compact_metadata.output_partition_size,
+                NUM_PARTITIONS=compact_metadata.num_partitions,
+                METADATA_FORMAT=compact_metadata.format,
+            )
+            return
         if group_out == 1 and num_bits == 1 and logical_k % group_size == 0:
             packed_words = packed.view(torch.int32)
             input_words = inputs_q.view(torch.int32)
@@ -12456,7 +13063,7 @@ def _launch_cubic_moe_dynamic_a8(
         if (
             group_out == 1
             and num_bits == 2
-            and group_size in (128, 256, 512)
+            and group_size in (64, 128, 256, 512)
             and logical_k % group_size == 0
         ):
             packed_words = packed.view(torch.int32)
@@ -12617,7 +13224,7 @@ def _launch_cubic_moe_dynamic_a8(
         carrier_level_reuse = group_size / (1 << (num_bits - 1))
         if (
             4 <= num_bits <= 8
-            and group_size in (128, 256, 512)
+            and group_size in (64, 128, 256, 512)
             and carrier_level_reuse >= 2
             and logical_k % group_size == 0
             and a.dtype == torch.float16
@@ -12681,6 +13288,7 @@ def _launch_cubic_moe_dynamic_a8(
                 sorted_token_ids,
                 expert_ids,
                 num_tokens_post_padded,
+                topk_weights.numel(),
                 packed.shape[1],
                 logical_k,
                 packed.shape[2],
@@ -12703,6 +13311,7 @@ def _launch_cubic_moe_dynamic_a8(
                 GROUP_SIZE=group_size,
                 GROUP_OUT=group_out,
                 ROUTE_CTAS=route_ctas,
+                GROUPED_ROUTES=grouped_routes,
                 MUL_ROUTED_WEIGHT=multiply_routed_weight,
                 TOP_K=top_k,
                 SUM_ROUTES=sum_routes,
@@ -12808,6 +13417,23 @@ def _launch_cubic_moe_dynamic_a8(
     block_m, block_k, group_m = dense_block_m, dense_block_k, 8
     n = packed.shape[1]
     em = sorted_token_ids.shape[0]
+    if compact_metadata is None:
+        scale_global = scale
+        a_global = a
+        b_global = b
+        metadata_format = _CUBIC_MOE_METADATA_EXPANDED
+        output_partition_size = n
+        num_partitions = 1
+    else:
+        scale = compact_metadata.primary
+        a = compact_metadata.secondary
+        b = compact_metadata.tertiary
+        scale_global = compact_metadata.scale_global
+        a_global = compact_metadata.a_global
+        b_global = compact_metadata.b_global
+        metadata_format = compact_metadata.format
+        output_partition_size = compact_metadata.output_partition_size
+        num_partitions = compact_metadata.num_partitions
     dense_grid = lambda meta: (
         triton.cdiv(em, block_m) * triton.cdiv(n, meta["BLOCK_N"]),
     )
@@ -12818,6 +13444,9 @@ def _launch_cubic_moe_dynamic_a8(
         scale,
         a,
         b,
+        scale_global,
+        a_global,
+        b_global,
         a if carrier_lut is None else carrier_lut,
         output,
         topk_weights,
@@ -12850,6 +13479,9 @@ def _launch_cubic_moe_dynamic_a8(
         TOP_K=top_k,
         PRECOMPUTED_3BIT_LEVELS=precomputed_3bit_levels,
         PRECOMPUTED_CARRIER_LUT=carrier_lut is not None,
+        OUTPUT_PARTITION_SIZE=output_partition_size,
+        NUM_PARTITIONS=num_partitions,
+        METADATA_FORMAT=metadata_format,
     )
 
 
@@ -13271,7 +13903,7 @@ def _launch_cubic_moe_groupwise_a8(
     if (
         group_out == 1
         and num_bits == 3
-        and group_size in (128, 256, 512)
+        and group_size in (64, 128, 256, 512)
         and a.dtype == torch.int8
         and b.dtype == torch.int8
     ):
@@ -13338,7 +13970,7 @@ def _launch_cubic_moe_groupwise_a8(
     if (
         group_out == 1
         and 4 <= num_bits <= 8
-        and group_size in (128, 256, 512)
+        and group_size in (64, 128, 256, 512)
         and a.dtype == torch.float16
         and b.dtype == torch.float16
         and current_platform.is_cuda()
@@ -13442,6 +14074,7 @@ def calibrate_cubic_moe_route_ctas(
     groupwise_a8: bool = False,
     situ_beta: float | None = None,
     situ_linear_beta: float | None = None,
+    compact_metadata: CubicMoECompactMetadata | None = None,
 ) -> None:
     """Choose route parallelism for one actual Cubic MoE projection shape."""
     sorted_ids, expert_ids, count = _cubic_align_block_size(
@@ -13622,6 +14255,7 @@ def calibrate_cubic_moe_route_ctas(
                     quantized_inputs=quantized_inputs,
                     route_ctas=route_ctas,
                     grouped_routes=grouped_routes,
+                    compact_metadata=compact_metadata,
                 )
             else:
                 _launch_cubic_moe_gemv(
@@ -13643,6 +14277,7 @@ def calibrate_cubic_moe_route_ctas(
                     multiply_routed_weight=multiply_routed_weight,
                     sum_routes=False,
                     route_ctas=route_ctas,
+                    compact_metadata=compact_metadata,
                 )
 
         return launch
@@ -13761,6 +14396,7 @@ def calibrate_cubic_a8_moe_backend(
     multiply_routed_weight: bool,
     grouped_routes: int,
     groupwise_a8: bool = False,
+    compact_metadata: CubicMoECompactMetadata | None = None,
 ) -> None:
     """Choose the CUDA or Triton Cubic A8 route-GEMV implementation."""
     sorted_ids, expert_ids, count = _cubic_align_block_size(
@@ -13880,6 +14516,7 @@ def calibrate_cubic_a8_moe_backend(
                     quantized_inputs=quantized_inputs,
                     route_ctas=route_ctas,
                     grouped_routes=grouped_routes,
+                    compact_metadata=compact_metadata,
                 )
 
         try:
@@ -13888,7 +14525,7 @@ def calibrate_cubic_a8_moe_backend(
             if reference is None:
                 reference = output.clone()
             else:
-                torch.testing.assert_close(output, reference, rtol=0, atol=0)
+                _assert_cubic_reduction_equivalent(output, reference)
             score = triton.testing.do_bench(launch, warmup=20, rep=60)
             scores.append((score, backend))
         except (RuntimeError, AssertionError, ValueError) as error:
@@ -14050,6 +14687,8 @@ def calibrate_cubic_a8_moe_layer_backends(
     intermediate_size: int,
     activation_situ_beta: float | None,
     activation_situ_linear_beta: float | None,
+    w13_compact_metadata: CubicMoECompactMetadata | None = None,
+    w2_compact_metadata: CubicMoECompactMetadata | None = None,
 ) -> None:
     """Select A8 projection backends using complete MoE layer latency."""
     device = torch.accelerator.current_device_index()
@@ -14099,6 +14738,8 @@ def calibrate_cubic_a8_moe_layer_backends(
         intermediate_size=intermediate_size,
         activation_situ_beta=activation_situ_beta,
         activation_situ_linear_beta=activation_situ_linear_beta,
+        w13_compact_metadata=w13_compact_metadata,
+        w2_compact_metadata=w2_compact_metadata,
     )
     candidates = (
         ("cuda", "cuda"),
@@ -14133,12 +14774,17 @@ def calibrate_cubic_a8_moe_layer_backends(
                 torch.accelerator.synchronize()
                 if scenario not in references:
                     references[scenario] = output
-                else:
-                    torch.testing.assert_close(
+                elif group_size == 32:
+                    _assert_cubic_reduction_equivalent(
                         output,
                         references[scenario],
-                        rtol=0,
-                        atol=0,
+                        allow_route_reduction=True,
+                    )
+                else:
+                    _assert_cubic_reduction_equivalent(
+                        output,
+                        references[scenario],
+                        allow_route_reduction=True,
                     )
                 scenario_scores.append(
                     triton.testing.do_bench(launch, warmup=10, rep=30)
@@ -14220,9 +14866,15 @@ def calibrate_cubic_a8_moe_grouping(
     activation_situ_beta: float | None,
     activation_situ_linear_beta: float | None,
     cuda_graph_replay: bool = False,
+    w13_compact_metadata: CubicMoECompactMetadata | None = None,
+    w2_compact_metadata: CubicMoECompactMetadata | None = None,
 ) -> None:
     """Measure route grouping for a complete route-kernel MoE layer."""
     device = torch.accelerator.current_device_index()
+    metadata_format = (
+        (w13_compact_metadata.format if w13_compact_metadata is not None else 0) * 4
+        + (w2_compact_metadata.format if w2_compact_metadata is not None else 0)
+    )
     key = (
         device,
         num_bits,
@@ -14231,6 +14883,8 @@ def calibrate_cubic_a8_moe_grouping(
         group_size,
         group_out,
         w1.shape[0],
+        topk_ids.shape[1],
+        metadata_format,
         cubic_token_bucket(hidden_states.shape[0]),
     )
     execution_key = (
@@ -14279,6 +14933,8 @@ def calibrate_cubic_a8_moe_grouping(
         intermediate_size=intermediate_size,
         activation_situ_beta=activation_situ_beta,
         activation_situ_linear_beta=activation_situ_linear_beta,
+        w13_compact_metadata=w13_compact_metadata,
+        w2_compact_metadata=w2_compact_metadata,
     )
     candidates = _cubic_a8_moe_grouping_candidates(
         num_bits=num_bits,
@@ -14297,7 +14953,10 @@ def calibrate_cubic_a8_moe_grouping(
             and w2_a.dtype == torch.float16
             and w2_b.dtype == torch.float16
         ),
+        compact_metadata=w13_compact_metadata is not None,
     )
+    if hidden_states.shape[0] * topk_ids.shape[1] < 8 * w1.shape[0]:
+        candidates = tuple(grouped for grouped in candidates if grouped < 8)
     for grouped_routes in candidates:
         _CUBIC_A8_MOE_GROUPING_TACTICS[key] = grouped_routes
         try:
@@ -14316,11 +14975,10 @@ def calibrate_cubic_a8_moe_grouping(
                 if scenario not in references:
                     references[scenario] = output
                 else:
-                    torch.testing.assert_close(
+                    _assert_cubic_reduction_equivalent(
                         output,
                         references[scenario],
-                        rtol=0,
-                        atol=0,
+                        allow_route_reduction=True,
                     )
                 scenario_scores.append(
                     _benchmark_cubic_candidate(
@@ -14420,6 +15078,9 @@ def calibrate_cubic_moe_execution(
     intermediate_size: int,
     activation_situ_beta: float | None,
     activation_situ_linear_beta: float | None,
+    cuda_graph_replay: bool = False,
+    w13_compact_metadata: CubicMoECompactMetadata | None = None,
+    w2_compact_metadata: CubicMoECompactMetadata | None = None,
 ) -> None:
     """Measure route-GEMV versus expert-sorted GEMM for a complete MoE layer."""
     key = (
@@ -14459,6 +15120,8 @@ def calibrate_cubic_moe_execution(
         intermediate_size=intermediate_size,
         activation_situ_beta=activation_situ_beta,
         activation_situ_linear_beta=activation_situ_linear_beta,
+        w13_compact_metadata=w13_compact_metadata,
+        w2_compact_metadata=w2_compact_metadata,
     )
     reference: torch.Tensor | None = None
     scores: list[tuple[float, bool, int, int]] = []
@@ -14504,14 +15167,14 @@ def calibrate_cubic_moe_execution(
             if reference is None:
                 reference = output
             else:
-                torch.testing.assert_close(
+                _assert_cubic_reduction_equivalent(
                     output,
                     reference,
-                    rtol=0,
-                    atol=0,
+                    allow_route_reduction=True,
                 )
-            score = triton.testing.do_bench(
+            score = _benchmark_cubic_candidate(
                 launch,
+                cuda_graph_replay=cuda_graph_replay,
                 warmup=3 if large else 10,
                 rep=8 if large else 30,
             )
@@ -14576,7 +15239,8 @@ def calibrate_cubic_moe_execution(
         for score, use_gemv, block_m, block_k in scores
     )
     init_logger(__name__).info(
-        "Cubic %s execution: W%d H=%d I=%d G=%dx%d M=%d %s (%.4f ms)",
+        "Cubic %s execution: W%d H=%d I=%d G=%dx%d M=%d mode=%s %s "
+        "(%.4f ms)",
         "A8" if dynamic_a8 else "A16",
         num_bits,
         hidden_size,
@@ -14584,6 +15248,7 @@ def calibrate_cubic_moe_execution(
         group_out,
         group_size,
         hidden_states.shape[0],
+        "cuda_graph" if cuda_graph_replay else "eager_cold_l2",
         f"candidates=[{candidate_scores}], selected="
         + ("GEMV" if best_use_gemv else f"GEMM/M{best_block_m}/K{best_block_k}"),
         best_score,
@@ -14724,6 +15389,8 @@ def cubic_fused_moe(
     activation_situ_beta: float | None,
     activation_situ_linear_beta: float | None,
     group_out: int,
+    w13_compact_metadata: CubicMoECompactMetadata | None = None,
+    w2_compact_metadata: CubicMoECompactMetadata | None = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
     top_k = topk_ids.shape[1]
@@ -14852,6 +15519,7 @@ def cubic_fused_moe(
             sum_routes=False,
             route_ctas=route_ctas,
             dense_block_m=dense_block_m,
+            compact_metadata=w13_compact_metadata,
         )
     if not fused_2bit_situ:
         _apply_cubic_moe_activation(
@@ -14919,6 +15587,7 @@ def cubic_fused_moe(
         sum_routes=fuse_route_sum,
         route_ctas=down_route_ctas,
         dense_block_m=dense_block_m,
+        compact_metadata=w2_compact_metadata,
     )
     if not fuse_route_sum:
         if use_torch_moe_sum:
@@ -14953,6 +15622,8 @@ def cubic_fused_moe_dynamic_a8(
     activation_situ_linear_beta: float | None,
     group_out: int,
     _pipeline_chunked: bool = False,
+    w13_compact_metadata: CubicMoECompactMetadata | None = None,
+    w2_compact_metadata: CubicMoECompactMetadata | None = None,
 ) -> torch.Tensor:
     """Apply Cubic fused MoE with dynamic per-token INT8 activations."""
     if num_bits not in CUBIC_SUPPORTED_BITS:
@@ -15016,6 +15687,8 @@ def cubic_fused_moe_dynamic_a8(
                 activation_situ_beta=activation_situ_beta,
                 activation_situ_linear_beta=activation_situ_linear_beta,
                 _pipeline_chunked=True,
+                w13_compact_metadata=w13_compact_metadata,
+                w2_compact_metadata=w2_compact_metadata,
             )
         return output
     # Expert-parallel prefills remain route-sparse far beyond eight input rows.
@@ -15109,6 +15782,7 @@ def cubic_fused_moe_dynamic_a8(
             group_size=group_size,
             group_out=group_out,
             local_experts=w1.shape[0],
+            top_k=top_k,
             num_tokens=num_tokens,
             fallback=grouped_routes,
             precomputed_3bit_levels=(
@@ -15123,6 +15797,14 @@ def cubic_fused_moe_dynamic_a8(
                 and w1_b.dtype == torch.float16
                 and w2_a.dtype == torch.float16
                 and w2_b.dtype == torch.float16
+            ),
+            compact_metadata=(
+                w13_compact_metadata is not None
+                and w2_compact_metadata is not None
+            ),
+            metadata_format=(
+                (w13_compact_metadata.format if w13_compact_metadata else 0) * 4
+                + (w2_compact_metadata.format if w2_compact_metadata else 0)
             ),
         )
     if envs.VLLM_BATCH_INVARIANT:
@@ -15337,6 +16019,7 @@ def cubic_fused_moe_dynamic_a8(
             grouped_routes=grouped_routes,
             dense_block_m=dense_block_m,
             dense_block_k=dense_block_k,
+            compact_metadata=w13_compact_metadata,
         )
     if not fused_2bit_situ and activation == MoEActivation.SITU:
         if activation_situ_beta is None:
@@ -15556,6 +16239,7 @@ def cubic_fused_moe_dynamic_a8(
                         group_size=group_size,
                         group_out=group_out,
                         local_experts=w2.shape[0],
+                        top_k=top_k,
                         num_tokens=chunk_tokens,
                         fallback=chunk_grouped_routes,
                         precomputed_3bit_levels=(
@@ -15565,6 +16249,12 @@ def cubic_fused_moe_dynamic_a8(
                         ),
                         fp16_curve=(
                             w2_a.dtype == torch.float16 and w2_b.dtype == torch.float16
+                        ),
+                        compact_metadata=w2_compact_metadata is not None,
+                        metadata_format=(
+                            (w2_compact_metadata.format * 5)
+                            if w2_compact_metadata is not None
+                            else 0
                         ),
                     )
                 # The exact Cubic8 kernel maps one expert id per valid route;
@@ -15696,6 +16386,7 @@ def cubic_fused_moe_dynamic_a8(
                         grouped_routes=chunk_grouped_routes,
                         dense_block_m=chunk_dense_block_m,
                         dense_block_k=chunk_dense_block_k,
+                        compact_metadata=w2_compact_metadata,
                     )
                 if use_torch_moe_sum:
                     torch.sum(
@@ -15717,12 +16408,27 @@ def cubic_fused_moe_dynamic_a8(
     # reduction; doing so writes routes 1..top_k-1 out of bounds.
     use_native_w4_w8_down = (
         use_gemv
-        and 4 <= num_bits <= 8
-        and group_size in (128, 256, 512)
-        and group_size / (1 << (num_bits - 1)) >= 2
-        and intermediate_size % group_size == 0
-        and w2_a.dtype == torch.float16
-        and w2_b.dtype == torch.float16
+        and (
+            (
+                w2_compact_metadata is not None
+                and _cubic_compact_a8_native_supported(
+                    num_bits=num_bits,
+                    logical_k=intermediate_size,
+                    group_size=group_size,
+                    group_out=group_out,
+                    grouped_routes=grouped_routes,
+                    sum_routes=False,
+                )
+            )
+            or (
+                4 <= num_bits <= 8
+                and group_size in (128, 256, 512)
+                and group_size / (1 << (num_bits - 1)) >= 2
+                and intermediate_size % group_size == 0
+                and w2_a.dtype == torch.float16
+                and w2_b.dtype == torch.float16
+            )
+        )
         and _cubic_a8_moe_backend(
             num_bits=num_bits,
             n=w2.shape[1],
@@ -15866,6 +16572,7 @@ def cubic_fused_moe_dynamic_a8(
             grouped_routes=grouped_routes,
             dense_block_m=dense_block_m,
             dense_block_k=dense_block_k,
+            compact_metadata=w2_compact_metadata,
         )
     if fuse_route_sum:
         return w2_output

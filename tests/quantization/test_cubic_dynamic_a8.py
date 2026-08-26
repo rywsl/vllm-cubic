@@ -94,6 +94,7 @@ def test_cubic_a8_moe_grouping_keeps_small_input_groups_singleton() -> None:
             group_size=128,
             group_out=1,
             local_experts=32,
+            top_k=8,
             num_tokens=1,
             fallback=8,
         )
@@ -115,9 +116,12 @@ def test_cubic_a8_moe_grouping_keeps_small_input_groups_singleton() -> None:
         (2, 1, 512, False, False, (1, 2, 4)),
         (2, 128, 512, False, False, (1,)),
         (3, 1, 256, True, False, (1, 2)),
+        (3, 1, 64, True, False, (1,)),
         (3, 128, 256, True, False, (1,)),
         (3, 1, 256, False, False, (1,)),
         (4, 128, 512, False, True, (1, 2, 4, 8)),
+        (5, 1, 64, False, True, (1, 2, 4, 8)),
+        (5, 1, 32, False, True, (1,)),
         (8, 128, 128, False, True, (1,)),
         (5, 512, 1, False, True, (1,)),
     ),
@@ -144,6 +148,97 @@ def test_cubic_a8_moe_grouping_candidates_match_exact_consumers(
         )
         == expected
     )
+
+
+def test_cubic_reduction_equivalence_accepts_one_output_ulp() -> None:
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        _assert_cubic_reduction_equivalent,
+    )
+
+    reference = torch.ones(1024, dtype=torch.bfloat16)
+    output = reference.clone()
+    output[0] = torch.nextafter(
+        reference[0], torch.tensor(torch.inf, dtype=torch.bfloat16)
+    )
+
+    _assert_cubic_reduction_equivalent(
+        output, reference, allow_route_reduction=True
+    )
+
+
+@pytest.mark.parametrize("nonfinite", (torch.nan, torch.inf, -torch.inf))
+def test_cubic_reduction_equivalence_rejects_nonfinite(nonfinite: float) -> None:
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        _assert_cubic_reduction_equivalent,
+    )
+
+    with pytest.raises(AssertionError):
+        _assert_cubic_reduction_equivalent(
+            torch.tensor([nonfinite], dtype=torch.bfloat16),
+            torch.tensor([nonfinite], dtype=torch.bfloat16),
+        )
+
+
+def test_cubic_reduction_equivalence_rejects_nine_output_ulps() -> None:
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        _assert_cubic_reduction_equivalent,
+    )
+
+    reference = torch.ones(1024, dtype=torch.bfloat16)
+    direction = torch.full_like(reference, torch.inf)
+    output = reference.clone()
+    for _ in range(9):
+        output[0] = torch.nextafter(output[0], direction[0])
+
+    with pytest.raises(AssertionError):
+        _assert_cubic_reduction_equivalent(
+            output, reference, allow_route_reduction=True
+        )
+
+
+def test_cubic_reduction_equivalence_rejects_unclassified_small_drift() -> None:
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        _assert_cubic_reduction_equivalent,
+    )
+
+    reference = torch.ones(1024, dtype=torch.float32)
+    output = reference + 5e-5
+
+    with pytest.raises(AssertionError):
+        _assert_cubic_reduction_equivalent(output, reference)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cubic_moe_sum_calibration_accepts_route_reduction_ulp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.quantization import cubic_kernels
+
+    tactics: dict[tuple[object, ...], bool] = {}
+    monkeypatch.setattr(cubic_kernels, "_CUBIC_MOE_SUM_TACTICS", tactics)
+    monkeypatch.setattr(
+        cubic_kernels.triton.testing,
+        "do_bench",
+        lambda function, **_: (function(), 1.0)[1],
+    )
+
+    def moe_sum(route_output, output, *_args) -> None:
+        torch.sum(route_output, dim=1, out=output)
+        output[0, 0] = torch.nextafter(
+            output[0, 0], torch.full_like(output[0, 0], torch.inf)
+        )
+
+    monkeypatch.setattr(cubic_kernels.ops, "moe_sum", moe_sum)
+    topk_ids = torch.zeros((4, 8), device="cuda", dtype=torch.int32)
+
+    cubic_kernels.calibrate_cubic_moe_sum_backend(
+        topk_ids,
+        expert_map=None,
+        hidden_size=32,
+        dtype=torch.bfloat16,
+    )
+
+    assert tactics
 
 
 @pytest.mark.parametrize(("tokens", "tail_routes"), ((1, 5), (64, 150)))
@@ -206,7 +301,7 @@ def test_cubic_a8_moe_grouping_rejects_incompatible_cached_tactic(
     )
 
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
-    key = (0, 3, 3072, 1024, 512, 128, 32, cubic_token_bucket(64))
+    key = (0, 3, 3072, 1024, 512, 128, 32, 8, 0, cubic_token_bucket(64))
     monkeypatch.setitem(cubic_kernels._CUBIC_A8_MOE_GROUPING_TACTICS, key, 2)
 
     assert (
@@ -217,11 +312,43 @@ def test_cubic_a8_moe_grouping_rejects_incompatible_cached_tactic(
             group_size=512,
             group_out=128,
             local_experts=32,
+            top_k=8,
             num_tokens=64,
             fallback=2,
             precomputed_3bit_levels=True,
         )
         == 1
+    )
+
+
+def test_cubic_a8_moe_grouping_uses_nearest_supported_tactic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.quantization import cubic_kernels
+
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    common = (0, 5, 3072, 512, 32, 1, 256, 8, 5)
+    monkeypatch.setattr(
+        cubic_kernels,
+        "_CUBIC_A8_MOE_GROUPING_TACTICS",
+        {(*common, 128): 4, (*common, 256): 8},
+    )
+
+    assert (
+        cubic_kernels._cubic_a8_moe_grouping(
+            num_bits=5,
+            hidden_size=3072,
+            intermediate_size=512,
+            group_size=32,
+            group_out=1,
+            local_experts=256,
+            top_k=8,
+            num_tokens=152,
+            fallback=1,
+            compact_metadata=True,
+            metadata_format=5,
+        )
+        == 4
     )
 
 
@@ -248,7 +375,10 @@ def test_cubic_a8_moe_grouping_prefers_calibrated_tactic(
     monkeypatch.setattr(
         cubic_kernels,
         "_CUBIC_A8_MOE_GROUPING_TACTICS",
-        {(7, 4, 4096, 2048, 512, 128, 32, 64): 1},
+        {
+            (7, 4, 4096, 2048, 512, 1, 32, 8, 0, 64): 1,
+            (7, 4, 4096, 2048, 512, 1, 32, 8, 6, 64): 4,
+        },
     )
 
     assert (
@@ -257,13 +387,105 @@ def test_cubic_a8_moe_grouping_prefers_calibrated_tactic(
             hidden_size=4096,
             intermediate_size=2048,
             group_size=512,
-            group_out=128,
+            group_out=1,
             local_experts=32,
+            top_k=8,
             num_tokens=64,
             fallback=8,
         )
         == 1
     )
+    assert (
+        cubic_kernels._cubic_a8_moe_grouping(
+            num_bits=4,
+            hidden_size=4096,
+            intermediate_size=2048,
+            group_size=512,
+            group_out=1,
+            local_experts=32,
+            top_k=8,
+            num_tokens=64,
+            fallback=8,
+            metadata_format=6,
+            compact_metadata=True,
+        )
+        == 4
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("bits", range(4, 9))
+@pytest.mark.parametrize("grouped_routes", (2, 4, 8))
+def test_cubic_a8_grouped_routes_preserve_expert_and_padding_indices(
+    bits: int, grouped_routes: int
+) -> None:
+    from vllm.model_executor.layers.quantization.cubic_kernels import (
+        _launch_cubic_moe_dynamic_a8,
+    )
+
+    device = torch.device("cuda")
+    tokens, top_k, experts = 4, 2, 4
+    hidden, outputs, group_size = 64, 32, 32
+    generator = torch.Generator(device=device).manual_seed(20260824 + bits)
+    codes = _make_codes((experts, outputs, hidden), bits).to(device)
+    packed = pack_cubic_codes(codes, bits)
+    metadata_shape = (experts, outputs, hidden // group_size)
+    scale = torch.rand(metadata_shape, generator=generator, device=device) * 0.02
+    a = torch.full(metadata_shape, 0.5, dtype=torch.float16, device=device)
+    b = torch.full(metadata_shape, 0.25, dtype=torch.float16, device=device)
+    values = torch.randint(
+        -127,
+        128,
+        (tokens, hidden),
+        generator=generator,
+        dtype=torch.int8,
+        device=device,
+    )
+    input_scale = torch.rand(tokens, 1, generator=generator, device=device) * 0.01
+    inputs = (values.float() * input_scale).to(torch.bfloat16)
+    topk_weights = torch.ones(tokens, top_k, dtype=torch.float32, device=device)
+    def run(routes_per_block: int) -> torch.Tensor:
+        routes_by_expert = ((0, 4), (1, 5), (2, 6), (3, 7))
+        sorted_routes: list[int] = []
+        expert_blocks: list[int] = []
+        for expert, routes in enumerate(routes_by_expert):
+            padded_routes = (*routes, *((tokens * top_k,) * (routes_per_block - 2)))
+            sorted_routes.extend(padded_routes)
+            expert_blocks.extend((expert,) * (len(padded_routes) // routes_per_block))
+        sorted_ids = torch.tensor(sorted_routes, dtype=torch.int32, device=device)
+        expert_ids = torch.tensor(expert_blocks, dtype=torch.int32, device=device)
+        padded_count = torch.tensor(
+            [sorted_ids.numel()], dtype=torch.int32, device=device
+        )
+        output = torch.zeros(
+            tokens, top_k, outputs, dtype=torch.bfloat16, device=device
+        )
+        _launch_cubic_moe_dynamic_a8(
+            inputs,
+            packed,
+            scale,
+            a,
+            b,
+            output,
+            topk_weights,
+            sorted_ids,
+            expert_ids,
+            padded_count,
+            logical_k=hidden,
+            num_bits=bits,
+            group_size=group_size,
+            group_out=1,
+            top_k=top_k,
+            multiply_routed_weight=False,
+            use_gemv=True,
+            sum_routes=False,
+            quantized_inputs=(values, input_scale),
+            route_ctas=sorted_ids.numel() // routes_per_block,
+            grouped_routes=routes_per_block,
+        )
+        return output
+
+    torch.testing.assert_close(run(grouped_routes), run(1), rtol=0, atol=0)
 
 
 def test_cubic_linear_tile_reuses_nearest_calibrated_shape(

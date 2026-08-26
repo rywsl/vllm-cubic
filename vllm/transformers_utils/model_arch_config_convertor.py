@@ -252,6 +252,13 @@ class ModelArchConfigConvertorBase:
             # Use the community standard 'quant_method'
             quant_method = quant_cfg.get("quant_method", "").lower()
 
+            # Some compressed-tensors multimodal checkpoints omit
+            # ``quant_method`` while retaining the complete config-groups
+            # schema. Infer the producer from that schema so the text model is
+            # not silently constructed with unquantized weights.
+            if not quant_method and "config_groups" in quant_cfg:
+                quant_method = "compressed-tensors"
+
             # Normalize library names
             quant_method = quant_method.replace(
                 "compressed_tensors", "compressed-tensors"

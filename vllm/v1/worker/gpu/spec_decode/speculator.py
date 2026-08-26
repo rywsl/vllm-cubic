@@ -16,6 +16,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models import supports_multimodal_embeddings
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.spec_decode.utils import resolve_local_argmax_reduction
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
     init_attn_backend,
@@ -288,6 +289,11 @@ class DraftModelSpeculator(BaseSpeculator):
         return attn_metadata
 
     def _validate_local_argmax_reduction(self) -> None:
+        self.use_local_argmax_reduction = resolve_local_argmax_reduction(
+            self.use_local_argmax_reduction,
+            self.speculative_config.draft_sample_method,
+            self.model,
+        )
         if not self.use_local_argmax_reduction:
             return
         if self.speculative_config.draft_sample_method == "probabilistic":

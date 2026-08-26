@@ -30,7 +30,7 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
 )
 from vllm.v1.kv_cache_interface import KVQuantMode
 
-SEGMENTED_DECODE_MAX_QUERY_LEN = 2
+SEGMENTED_DECODE_MAX_QUERY_LEN = 4
 
 logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT

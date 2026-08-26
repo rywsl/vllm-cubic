@@ -143,11 +143,11 @@ class SpeculativeConfig:
     speculative input batches can contain sequences of different lengths,
     which may only be supported by certain attention backends. This currently
     only affects the EAGLE method of speculation."""
-    use_local_argmax_reduction: bool = False
+    use_local_argmax_reduction: bool | None = None
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to
-    O(2 * tp_size) per token. Only applies to greedy draft selection in
-    non-tree speculation."""
+    O(2 * tp_size) per token. ``None`` enables it automatically when the draft
+    model exposes the required operation and draft sampling is greedy."""
 
     use_heterogeneous_vocab: bool = False
     """Allow draft and target models to use different vocabularies.

@@ -108,7 +108,7 @@ CONTRACTS = (
         "vllm/model_executor/warmup/cubic_warmup.py",
         (
             "def _calibration_token_buckets(",
-            "representatives = (1, 2, 16, 64, 256, 512)",
+            "representatives = (1, 2, 16, 32, 64, 128, 256, 512)",
             "def _moe_calibration_token_buckets(",
             "moe_token_buckets=moe_token_buckets",
             "def _materialization_token_buckets(",

@@ -11,6 +11,18 @@ from vllm.model_executor.warmup import cubic_warmup
 from vllm.model_executor.warmup.cubic_warmup import _assign_cubic_tasks
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cubic_synthetic_routes_model_router_collisions() -> None:
+    layer = SimpleNamespace(top_k=8, global_num_experts=256, expert_map=None)
+
+    _, first = cubic_warmup._synthetic_routes(layer, 32)
+    _, second = cubic_warmup._synthetic_routes(layer, 32)
+
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+    assert torch.all(first.sort(dim=1).values.diff(dim=1) != 0)
+    assert first.unique().numel() < first.numel()
+
+
 def test_cubic_tactic_cache_key_allows_unbundled_native_sources(monkeypatch):
     original_read_bytes = Path.read_bytes
 
@@ -255,11 +267,16 @@ def test_cubic_calibration_uses_bounded_representative_buckets():
         (1, 2, 4, 8, 16, 32, 64, 128, 256, 512),
     )
 
-    assert buckets == (1, 2, 16, 64, 256, 512)
+    assert buckets == (1, 2, 16, 32, 64, 128, 256, 512)
 
 
 def test_cubic_calibration_keeps_the_largest_small_bucket():
-    assert cubic_warmup._calibration_token_buckets(32, ()) == (1, 2, 16, 32)
+    assert cubic_warmup._calibration_token_buckets(32, ()) == (
+        1,
+        2,
+        16,
+        32,
+    )
 
 
 def test_cubic_moe_calibration_adds_only_the_largest_runtime_bucket():
@@ -269,12 +286,17 @@ def test_cubic_moe_calibration_adds_only_the_largest_runtime_bucket():
         1,
         2,
         16,
+        32,
         64,
+        128,
         256,
         512,
         8192,
     )
-    assert cubic_warmup._moe_calibration_token_buckets(256, base[:5]) == base[:5]
+    assert cubic_warmup._moe_calibration_token_buckets(256, base[:5]) == (
+        *base[:5],
+        256,
+    )
 
 
 def test_cubic_calibration_routes_large_bucket_only_to_moe() -> None:
@@ -310,6 +332,8 @@ def test_cubic_calibration_routes_large_bucket_only_to_moe() -> None:
     moe.w13_weight_packed = torch.empty(
         32, 0, 0, device="meta", dtype=torch.uint8
     )
+    moe.w13_weight_scale = torch.empty(0, device="meta", dtype=torch.float32)
+    moe.w2_weight_scale = torch.empty(0, device="meta", dtype=torch.float32)
     moe.w13_weight_a = torch.empty(0, device="meta", dtype=torch.float16)
     moe.w2_weight_a = torch.empty(0, device="meta", dtype=torch.float16)
     moe.activation = "silu"

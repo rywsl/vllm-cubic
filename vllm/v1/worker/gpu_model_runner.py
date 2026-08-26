@@ -2145,12 +2145,37 @@ class GPUModelRunner(
         )
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
+        # Keep align-mode speculative accepted counts on GPU. The fused Mamba
+        # postprocess output is in previous-batch row order, so gather it using
+        # the same current-to-previous mapping used by the other persistent
+        # batch tensors. This avoids waiting for the diagnostic CPU mirror on
+        # every decode step.
+        mamba_align_ctx = None
+        if (
+            self.cache_config.mamba_cache_mode == "align"
+            and self.speculative_config is not None
+            and self.model_config.is_hybrid
+        ):
+            mamba_align_ctx = self._get_mamba_bufs().postprocess_align
+            assert mamba_align_ctx is not None
+            self.prev_positions.copy_to_gpu(num_reqs)
+            mamba_align_ctx.remap_accepted_tokens(
+                num_reqs,
+                self.prev_positions.gpu,
+                self.num_accepted_tokens.gpu,
+            )
+
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
         # Skipped under async scheduling (non-align): the CPU copy races with
         # the in-flight D2H copy and with input-batch row moves.
-        needs_cpu_accepted_counts = self.num_accepted_tokens_event is not None and not (
-            self.use_async_scheduling and self.cache_config.mamba_cache_mode != "align"
+        needs_cpu_accepted_counts = (
+            self.num_accepted_tokens_event is not None
+            and mamba_align_ctx is None
+            and not (
+                self.use_async_scheduling
+                and self.cache_config.mamba_cache_mode != "align"
+            )
         )
         if needs_cpu_accepted_counts:
             assert self.num_accepted_tokens_event is not None
@@ -2175,7 +2200,7 @@ class GPUModelRunner(
                 )
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.num_accepted_tokens.copy_to_gpu()
-        else:
+        elif mamba_align_ctx is None:
             # Default to 1; update_num_computed_tokens_for_batch_change below
             # corrects rows that had drafts from valid_sampled_token_count.
             self.num_accepted_tokens.np.fill(1)
@@ -4436,15 +4461,21 @@ class GPUModelRunner(
                     self.model.get_mamba_state_copy_func(),
                     mamba_bufs.preprocess,
                     align_ctx=mamba_bufs.postprocess_align,
+                    num_accepted_tokens_gpu=(
+                        self.num_accepted_tokens.gpu
+                        if mamba_bufs.postprocess_align is not None
+                        else None
+                    ),
                 )
                 # preprocess_mamba resets num_accepted_tokens_cpu to 1
                 # for requests whose state was copied to a new block.
                 # Re-sync to GPU so the mamba kernel reads from the
                 # correct initial state slot (init_token_idx = 0).
-                self.num_accepted_tokens.np[:num_reqs] = (
-                    self.input_batch.num_accepted_tokens_cpu[:num_reqs]
-                )
-                self.num_accepted_tokens.copy_to_gpu(num_reqs)
+                if mamba_bufs.postprocess_align is None:
+                    self.num_accepted_tokens.np[:num_reqs] = (
+                        self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+                    )
+                    self.num_accepted_tokens.copy_to_gpu(num_reqs)
 
                 # Stage per-request inputs for the fused postprocess kernel
                 # only when that kernel will actually run. The kernel is

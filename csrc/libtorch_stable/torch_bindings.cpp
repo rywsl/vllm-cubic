@@ -88,6 +88,23 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "bool multiply_routed_weight, int route_ctas, "
       "int num_valid_tokens, int routes_per_block) -> ()");
   ops.def(
+      "cubic_w4_w8_compact_a8_gemv(Tensor input, Tensor input_scale, "
+      "Tensor weight, Tensor primary, Tensor secondary, Tensor tertiary, "
+      "Tensor scale_global, Tensor a_global, Tensor b_global, Tensor! output, "
+      "Tensor topk_weights, Tensor token_ids, Tensor expert_ids, "
+      "Tensor num_routes, int bits, int group_size, int group_out, int top_k, "
+      "bool multiply_routed_weight, int route_ctas, "
+      "int num_valid_tokens, int output_partition_size, int num_partitions, "
+      "int metadata_format, int routes_per_block) -> ()");
+  ops.def(
+      "cubic_w4_w8_compact_a8_fused_sum(Tensor input, Tensor input_scale, "
+      "Tensor weight, Tensor primary, Tensor secondary, Tensor tertiary, "
+      "Tensor scale_global, Tensor a_global, Tensor b_global, Tensor! output, "
+      "Tensor topk_weights, Tensor topk_ids, Tensor expert_map, int bits, "
+      "int group_size, int group_out, bool multiply_routed_weight, "
+      "int output_partition_size, int num_partitions, "
+      "int metadata_format) -> ()");
+  ops.def(
       "cubic_w4_w8_a8_gemv(Tensor input, Tensor input_scale, Tensor weight, "
       "Tensor weight_scale, Tensor cubic_a, Tensor cubic_b, Tensor! output, "
       "Tensor topk_weights, Tensor token_ids, Tensor expert_ids, "

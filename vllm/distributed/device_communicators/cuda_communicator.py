@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -82,9 +84,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
         from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
 
         self.pynccl_comm: PyNcclCommunicator | None = None
+        self.pynccl_simple_comm: PyNcclCommunicator | None = None
+        self.pynccl_simple_buckets: frozenset[int] = frozenset()
         if self.world_size > 1:
+            self.pynccl_group = (
+                self.cpu_group if tcp_store_group is None else tcp_store_group
+            )
             self.pynccl_comm = PyNcclCommunicator(
-                group=self.cpu_group if tcp_store_group is None else tcp_store_group,
+                group=self.pynccl_group,
                 device=self.device,
             )
             if is_symmetric_memory_enabled():
@@ -132,6 +139,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # On ROCm, 'use_custom_allreduce==True' means it must currently be
             # an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+
+        if (
+            "tp" in unique_name
+            and self.world_size >= 4
+            and current_platform.is_cuda()
+            and self.pynccl_comm is not None
+            and not self.pynccl_comm.disabled
+            and "NCCL_PROTO" not in os.environ
+            and not envs.VLLM_BATCH_INVARIANT
+        ):
+            self._init_pynccl_protocol_dispatch(PyNcclCommunicator)
 
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
@@ -272,6 +290,88 @@ class CudaCommunicator(DeviceCommunicatorBase):
             scope="global",
         )
 
+    @staticmethod
+    def _pynccl_protocol_bucket(nbytes: int) -> int:
+        bucket_size = 64 * 1024
+        return ((nbytes + bucket_size - 1) // bucket_size) * bucket_size
+
+    def _init_pynccl_protocol_dispatch(self, communicator_cls) -> None:
+        simple_comm = communicator_cls(
+            group=self.pynccl_group,
+            device=self.device,
+            protocol="Simple",
+        )
+        if simple_comm.disabled:
+            return
+
+        default_comm = self.pynccl_comm
+        assert default_comm is not None
+        bucket_size = 64 * 1024
+        buckets = tuple(range(bucket_size, 2 * 1024 * 1024 + 1, bucket_size))
+        selected_mask = 0
+        for index, nbytes in enumerate(buckets):
+            numel = nbytes // torch.bfloat16.itemsize
+            input_ = torch.ones(numel, dtype=torch.bfloat16, device=self.device)
+            output = torch.empty_like(input_)
+
+            def measure(comm, input_, output) -> float:
+                for _ in range(5):
+                    comm.all_reduce(input_, output)
+                torch.cuda.synchronize(self.device)
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                for _ in range(50):
+                    comm.all_reduce(input_, output)
+                end.record()
+                end.synchronize()
+                return start.elapsed_time(end)
+
+            default_ms = measure(default_comm, input_, output)
+            simple_ms = measure(simple_comm, input_, output)
+            simple_ms += measure(simple_comm, input_, output)
+            default_ms += measure(default_comm, input_, output)
+            timings = torch.tensor([default_ms, simple_ms], dtype=torch.float64)
+            torch.distributed.all_reduce(
+                timings,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.cpu_group,
+            )
+            if self.rank == 0 and timings[1] < timings[0] * 0.90:
+                selected_mask |= 1 << index
+
+        if self.rank == 0:
+            selected_mask &= (selected_mask << 1) | (selected_mask >> 1)
+        mask_tensor = torch.tensor([selected_mask], dtype=torch.int64)
+        ranks = torch.distributed.get_process_group_ranks(self.cpu_group)
+        torch.distributed.broadcast(mask_tensor, src=ranks[0], group=self.cpu_group)
+        selected_mask = mask_tensor.item()
+        selected = frozenset(
+            bucket
+            for index, bucket in enumerate(buckets)
+            if selected_mask & (1 << index)
+        )
+        if not selected:
+            simple_comm.destroy()
+            return
+
+        self.pynccl_simple_comm = simple_comm
+        self.pynccl_simple_buckets = selected
+        logger.info_once(
+            "PyNccl protocol dispatch selected Simple for byte buckets %s.",
+            tuple(sorted(selected)),
+            scope="global",
+        )
+
+    def _select_pynccl_comm(self, input_: torch.Tensor):
+        if (
+            self.pynccl_simple_comm is not None
+            and self._pynccl_protocol_bucket(input_.nbytes)
+            in self.pynccl_simple_buckets
+        ):
+            return self.pynccl_simple_comm
+        return self.pynccl_comm
+
     def all_reduce(self, input_):
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
@@ -324,7 +424,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = symm_mem_comm.all_reduce(input_)
             assert out is not None
             return out
-        pynccl_comm = self.pynccl_comm
+        pynccl_comm = self._select_pynccl_comm(input_)
         if pynccl_comm is None or pynccl_comm.disabled:
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
@@ -381,8 +481,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             return [self.all_reduce(input_) for input_ in inputs]
 
-        pynccl_comm = self.pynccl_comm
+        pynccl_comm = self._select_pynccl_comm(inputs[0])
         assert pynccl_comm is not None
+        if any(
+            self._select_pynccl_comm(input_) is not pynccl_comm for input_ in inputs
+        ):
+            return [self.all_reduce(input_) for input_ in inputs]
         outputs = [torch.empty_like(input_) for input_ in inputs]
         pynccl_comm.group_start()
         for input_, output in zip(inputs, outputs):
@@ -620,6 +724,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
+        if self.pynccl_simple_comm is not None:
+            self.pynccl_simple_comm.destroy()
+            self.pynccl_simple_comm = None
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None

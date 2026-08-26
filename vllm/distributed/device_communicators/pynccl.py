@@ -3,6 +3,7 @@
 
 
 # ===================== import region =====================
+import os
 import threading
 
 import torch
@@ -26,6 +27,7 @@ from vllm.utils.torch_utils import current_stream
 logger = init_logger(__name__)
 
 _NCCL_SYMM_OPS_REGISTERED = False
+_NCCL_INIT_ENV_LOCK = threading.Lock()
 
 
 def register_nccl_symmetric_ops(pynccl_comm):
@@ -63,6 +65,7 @@ class PyNcclCommunicator:
         group: ProcessGroup | StatelessProcessGroup,
         device: int | str | torch.device,
         library_path: str | None = None,
+        protocol: str | None = None,
     ):
         """
         Args:
@@ -72,6 +75,8 @@ class PyNcclCommunicator:
                 it will be bound to f"cuda:{local_rank}".
             library_path: the path to the NCCL library. If None, it will
                 use the default library path.
+            protocol: optional NCCL protocol used only while initializing this
+                communicator.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device.
         """
@@ -134,9 +139,20 @@ class PyNcclCommunicator:
         self.device = device
         # nccl communicator and stream will use this device
         with torch.accelerator.device_index(device.index):
-            self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
-                self.world_size, self.unique_id, self.rank
-            )
+            with _NCCL_INIT_ENV_LOCK:
+                previous_protocol = os.environ.get("NCCL_PROTO")
+                if protocol is not None:
+                    os.environ["NCCL_PROTO"] = protocol
+                try:
+                    self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
+                        self.world_size, self.unique_id, self.rank
+                    )
+                finally:
+                    if protocol is not None:
+                        if previous_protocol is None:
+                            os.environ.pop("NCCL_PROTO", None)
+                        else:
+                            os.environ["NCCL_PROTO"] = previous_protocol
 
             stream = current_stream()
             # A small all_reduce for warmup.

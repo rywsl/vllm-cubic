@@ -57,7 +57,7 @@ from vllm.model_executor.layers.quantization.cubic_policy import (
 
 logger = init_logger(__name__)
 
-_CUBIC_TACTIC_CACHE_SCHEMA = 48
+_CUBIC_TACTIC_CACHE_SCHEMA = 53
 _CUBIC_TACTIC_CACHE_FILENAME = "cubic_tactics.json"
 _CUBIC_TACTIC_REGISTRY_NAMES = (
     "_CUBIC_W2_A8_SITU_TACTICS",
@@ -94,6 +94,34 @@ def _linear_metadata_signature(
     return str(layer.weight_a.dtype), str(layer.weight_b.dtype)
 
 
+def _moe_metadata_signature(
+    layer: torch.nn.Module, method: CubicMoEMethod
+) -> tuple[str, ...]:
+    if method.scheme.metadata_format == CUBIC_E5M9_CURVE2_METADATA_FORMAT:
+        return (
+            str(layer.w13_weight_metadata.dtype),
+            str(layer.w2_weight_metadata.dtype),
+            str(layer.w13_weight_curve_a.dtype),
+        )
+    if method.scheme.metadata_format == CUBIC_COMPACT_METADATA_FORMAT:
+        return (
+            str(layer.w13_weight_scale.dtype),
+            str(layer.w2_weight_scale.dtype),
+            str(layer.w13_weight_ab.dtype),
+        )
+    return (
+        str(layer.w13_weight_scale.dtype),
+        str(layer.w2_weight_scale.dtype),
+        str(layer.w13_weight_a.dtype),
+    )
+
+
+def _moe_runtime_group_size(
+    layer: torch.nn.Module, method: CubicMoEMethod
+) -> int:
+    return int(getattr(layer, "cubic_runtime_group_size", method.scheme.group_size))
+
+
 def _cubic_tactic_registries() -> dict[str, dict[tuple[Any, ...], Any]]:
     from vllm.model_executor.layers.quantization import cubic_kernels
 
@@ -127,7 +155,7 @@ def _cubic_model_signature(
                 [
                     "moe",
                     method.scheme.num_bits,
-                    method.scheme.group_size,
+                    _moe_runtime_group_size(module, method),
                     method.scheme.group_out,
                     int(module.cubic_hidden_size),
                     int(module.cubic_intermediate_size),
@@ -135,8 +163,8 @@ def _cubic_model_signature(
                     int(module.global_num_experts),
                     list(module.w13_weight_packed.shape),
                     list(module.w2_weight_packed.shape),
-                    str(module.w13_weight_a.dtype),
-                    str(module.w2_weight_a.dtype),
+                    *_moe_metadata_signature(module, method),
+                    method.scheme.metadata_format,
                     str(module.activation),
                     bool(module.apply_router_weight_on_input),
                     method.moe.activation_situ_beta,
@@ -295,15 +323,15 @@ def _moe_task_id(
     return (
         "moe",
         method.scheme.num_bits,
-        method.scheme.group_size,
+        _moe_runtime_group_size(layer, method),
         method.scheme.group_out,
         int(layer.cubic_hidden_size),
         int(layer.cubic_intermediate_size),
         int(layer.top_k),
         int(layer.w13_weight_packed.shape[0]),
         int(layer.global_num_experts),
-        str(layer.w13_weight_a.dtype),
-        str(layer.w2_weight_a.dtype),
+        *_moe_metadata_signature(layer, method),
+        method.scheme.metadata_format,
         str(layer.activation),
         bool(layer.apply_router_weight_on_input),
         method.moe.activation_situ_beta,
@@ -660,7 +688,7 @@ def _cubic_w2_a8_situ_specs(
                 int(n),
                 int(k),
                 method.scheme.group_out,
-                method.scheme.group_size,
+                _moe_runtime_group_size(module, method),
                 int(top_k),
                 packed.shape[0],
             )
@@ -673,7 +701,7 @@ def _calibration_token_buckets(
 ) -> tuple[int, ...]:
     del capture_sizes
     largest_bucket = cubic_token_bucket(max_tokens)
-    representatives = (1, 2, 16, 64, 256, 512)
+    representatives = (1, 2, 16, 32, 64, 128, 256, 512)
     selected = tuple(bucket for bucket in representatives if bucket <= largest_bucket)
     if largest_bucket not in selected and largest_bucket < representatives[-1]:
         selected = (*selected, largest_bucket)
@@ -2534,9 +2562,15 @@ def _synthetic_routes(
     top_k = int(layer.top_k)
     expert_map = getattr(layer, "expert_map", None)
     if expert_map is None:
-        topk_ids = torch.arange(
-            tokens * top_k, device="cuda", dtype=torch.int32
-        ).remainder_(layer.global_num_experts)
+        generator = torch.Generator(device="cuda").manual_seed(
+            0xC0B1C + tokens * 131 + top_k * 17 + layer.global_num_experts
+        )
+        topk_ids = torch.rand(
+            tokens,
+            layer.global_num_experts,
+            device="cuda",
+            generator=generator,
+        ).topk(top_k, dim=1, sorted=False).indices.to(torch.int32)
     else:
         local = (expert_map >= 0).nonzero().flatten().to(torch.int32)
         remote = (expert_map < 0).nonzero().flatten().to(torch.int32)
@@ -2586,6 +2620,7 @@ def _warmup_cubic_moe_families(
 ) -> None:
     from vllm.model_executor.layers.quantization.cubic_kernels import (
         _cubic_a8_moe_grouping,
+        _cubic_a8_moe_grouping_candidates,
         calibrate_cubic_a8_moe_backend,
         calibrate_cubic_a8_moe_grouping,
         calibrate_cubic_a8_moe_layer_backends,
@@ -2606,7 +2641,7 @@ def _warmup_cubic_moe_families(
 
     for layer, method in layers.values():
         bits = method.scheme.num_bits
-        group_size = method.scheme.group_size
+        group_size = _moe_runtime_group_size(layer, method)
         group_out = method.scheme.group_out
         hidden = int(layer.cubic_hidden_size)
         intermediate = int(layer.cubic_intermediate_size)
@@ -2632,26 +2667,50 @@ def _warmup_cubic_moe_families(
             experts,
             assigned_tokens,
         )
+        compact_metadata = method.scheme.metadata_format in (
+            CUBIC_COMPACT_METADATA_FORMAT,
+            CUBIC_E5M9_CURVE2_METADATA_FORMAT,
+        )
+        if compact_metadata:
+            (
+                w13_scale,
+                w2_scale,
+                w13_a,
+                w13_b,
+                w2_a,
+                w2_b,
+                w13_compact_metadata,
+                w2_compact_metadata,
+            ) = method.runtime_metadata(layer)
+        else:
+            w13_scale = layer.w13_weight_scale
+            w2_scale = layer.w2_weight_scale
+            w13_a = layer.w13_weight_a
+            w13_b = layer.w13_weight_b
+            w2_a = layer.w2_weight_a
+            w2_b = layer.w2_weight_b
+            w13_compact_metadata = None
+            w2_compact_metadata = None
         a16_coefficients: tuple[torch.Tensor, ...] | None = None
         a8_coefficients: tuple[torch.Tensor, ...] | None = None
-        if bits == 3 and layer.w13_weight_a.dtype == torch.int8:
+        if bits == 3 and w13_a.dtype == torch.int8:
             # Dynamic-A8 stores precomputed carrier levels in a/b. A16 needs
             # FP16 polynomial coefficients; synthetic values preserve the
             # exact production shapes without mutating the loaded checkpoint.
             a16_coefficients = tuple(
                 torch.full_like(value, 0.5, dtype=torch.float16)
                 for value in (
-                    layer.w13_weight_a,
-                    layer.w13_weight_b,
-                    layer.w2_weight_a,
-                    layer.w2_weight_b,
+                    w13_a,
+                    w13_b,
+                    w2_a,
+                    w2_b,
                 )
             )
         elif bits == 3:
             carrier_metadata: list[torch.Tensor] = []
             for coefficient_a, coefficient_b in (
-                (layer.w13_weight_a, layer.w13_weight_b),
-                (layer.w2_weight_a, layer.w2_weight_b),
+                (w13_a, w13_b),
+                (w2_a, w2_b),
             ):
                 levels = cubic_carrier_levels(3, coefficient_a, coefficient_b)
                 carrier_metadata.extend(
@@ -2676,20 +2735,20 @@ def _warmup_cubic_moe_families(
                 a8_coefficients
                 if a8_coefficients is not None
                 else (
-                    layer.w13_weight_a,
-                    layer.w13_weight_b,
-                    layer.w2_weight_a,
-                    layer.w2_weight_b,
+                    w13_a,
+                    w13_b,
+                    w2_a,
+                    w2_b,
                 )
             )
             a16_a, a16_b, a16_w2_a, a16_w2_b = (
                 a16_coefficients
                 if a16_coefficients is not None
                 else (
-                    layer.w13_weight_a,
-                    layer.w13_weight_b,
-                    layer.w2_weight_a,
-                    layer.w2_weight_b,
+                    w13_a,
+                    w13_b,
+                    w2_a,
+                    w2_b,
                 )
             )
             if not calibrate:
@@ -2704,8 +2763,8 @@ def _warmup_cubic_moe_families(
                     x,
                     layer.w13_weight_packed,
                     layer.w2_weight_packed,
-                    layer.w13_weight_scale,
-                    layer.w2_weight_scale,
+                    w13_scale,
+                    w2_scale,
                     gate_a,
                     gate_b,
                     down_a,
@@ -2725,12 +2784,33 @@ def _warmup_cubic_moe_families(
                     activation_situ_linear_beta=(
                         method.moe.activation_situ_linear_beta
                     ),
+                    w13_compact_metadata=w13_compact_metadata,
+                    w2_compact_metadata=w2_compact_metadata,
                 )
                 if not torch.isfinite(output).all():
                     raise AssertionError(
                         f"Non-finite Cubic MoE materialization output for W{bits}."
                     )
                 continue
+            grouping_candidates = _cubic_a8_moe_grouping_candidates(
+                num_bits=bits,
+                group_size=group_size,
+                group_out=group_out,
+                precomputed_3bit_levels=(
+                    bits == 3
+                    and a8_a.dtype == torch.int8
+                    and a8_b.dtype == torch.int8
+                    and a8_w2_a.dtype == torch.int8
+                    and a8_w2_b.dtype == torch.int8
+                ),
+                fp16_curve=(
+                    a8_a.dtype == torch.float16
+                    and a8_b.dtype == torch.float16
+                    and a8_w2_a.dtype == torch.float16
+                    and a8_w2_b.dtype == torch.float16
+                ),
+                compact_metadata=compact_metadata,
+            )
             has_cuda_candidate = (
                 (bits == 2 and group_size in (256, 512))
                 or (
@@ -2738,7 +2818,15 @@ def _warmup_cubic_moe_families(
                     and a8_a.dtype == torch.int8
                     and group_size in (128, 256, 512)
                 )
-            ) or (4 <= bits <= 8 and group_size in (128, 256, 512))
+            ) or (
+                4 <= bits <= 8
+                and group_size in (64, 128, 256, 512)
+                and group_size / (1 << (bits - 1)) >= 2
+                and a8_a.dtype == torch.float16
+                and a8_b.dtype == torch.float16
+                and a8_w2_a.dtype == torch.float16
+                and a8_w2_b.dtype == torch.float16
+            )
             grouped_routes = (
                 2
                 if group_size in (256, 512)
@@ -2751,8 +2839,7 @@ def _warmup_cubic_moe_families(
             can_calibrate_grouping = (
                 method.dynamic_a8
                 and tokens <= 1024
-                and group_size in (128, 256, 512)
-                and (bits == 2 or has_cuda_candidate)
+                and len(grouping_candidates) > 1
             )
             phase_index = 0
             if can_calibrate_grouping:
@@ -2760,8 +2847,8 @@ def _warmup_cubic_moe_families(
                     x,
                     layer.w13_weight_packed,
                     layer.w2_weight_packed,
-                    layer.w13_weight_scale,
-                    layer.w2_weight_scale,
+                    w13_scale,
+                    w2_scale,
                     a8_a,
                     a8_b,
                     a8_w2_a,
@@ -2782,6 +2869,8 @@ def _warmup_cubic_moe_families(
                         method.moe.activation_situ_linear_beta
                     ),
                     cuda_graph_replay=tokens in graph_capture_sizes,
+                    w13_compact_metadata=w13_compact_metadata,
+                    w2_compact_metadata=w2_compact_metadata,
                 )
                 grouped_routes = _cubic_a8_moe_grouping(
                     num_bits=bits,
@@ -2790,6 +2879,7 @@ def _warmup_cubic_moe_families(
                     group_size=group_size,
                     group_out=group_out,
                     local_experts=experts,
+                    top_k=top_k,
                     num_tokens=tokens,
                     fallback=grouped_routes,
                     precomputed_3bit_levels=(
@@ -2804,6 +2894,14 @@ def _warmup_cubic_moe_families(
                         and a8_b.dtype == torch.float16
                         and a8_w2_a.dtype == torch.float16
                         and a8_w2_b.dtype == torch.float16
+                    ),
+                    compact_metadata=compact_metadata,
+                    metadata_format=(
+                        (w13_compact_metadata.format * 4)
+                        + w2_compact_metadata.format
+                        if w13_compact_metadata is not None
+                        and w2_compact_metadata is not None
+                        else 0
                     ),
                 )
             # Singleton routes have a generic Triton competitor for W2-W8;
@@ -2841,7 +2939,7 @@ def _warmup_cubic_moe_families(
             calibrate_cubic_moe_route_ctas(
                 x,
                 layer.w13_weight_packed,
-                layer.w13_weight_scale,
+                w13_scale,
                 gate_a,
                 gate_b,
                 topk_weights,
@@ -2866,6 +2964,7 @@ def _warmup_cubic_moe_families(
                     if bits == 2 and layer.activation == MoEActivation.SITU
                     else None
                 ),
+                compact_metadata=w13_compact_metadata,
             )
             phase_index += 1
             if progress is not None:
@@ -2878,7 +2977,7 @@ def _warmup_cubic_moe_families(
             calibrate_cubic_moe_route_ctas(
                 down_inputs,
                 layer.w2_weight_packed,
-                layer.w2_weight_scale,
+                w2_scale,
                 down_a,
                 down_b,
                 down_topk_weights,
@@ -2893,6 +2992,7 @@ def _warmup_cubic_moe_families(
                 top_k=1,
                 multiply_routed_weight=(not layer.apply_router_weight_on_input),
                 grouped_routes=route_grouping,
+                compact_metadata=w2_compact_metadata,
             )
             phase_index += 1
             if progress is not None:
@@ -2906,7 +3006,7 @@ def _warmup_cubic_moe_families(
                 calibrate_cubic_a8_moe_backend(
                     x,
                     layer.w13_weight_packed,
-                    layer.w13_weight_scale,
+                    w13_scale,
                     a8_a,
                     a8_b,
                     topk_weights,
@@ -2920,6 +3020,7 @@ def _warmup_cubic_moe_families(
                     top_k=top_k,
                     multiply_routed_weight=layer.apply_router_weight_on_input,
                     grouped_routes=grouped_routes,
+                    compact_metadata=w13_compact_metadata,
                 )
                 phase_index += 1
                 if progress is not None:
@@ -2927,7 +3028,7 @@ def _warmup_cubic_moe_families(
                 calibrate_cubic_a8_moe_backend(
                     down_inputs,
                     layer.w2_weight_packed,
-                    layer.w2_weight_scale,
+                    w2_scale,
                     a8_w2_a,
                     a8_w2_b,
                     down_topk_weights,
@@ -2941,6 +3042,7 @@ def _warmup_cubic_moe_families(
                     top_k=1,
                     multiply_routed_weight=not layer.apply_router_weight_on_input,
                     grouped_routes=grouped_routes,
+                    compact_metadata=w2_compact_metadata,
                 )
                 phase_index += 1
                 if progress is not None:
@@ -2949,8 +3051,8 @@ def _warmup_cubic_moe_families(
                     x,
                     layer.w13_weight_packed,
                     layer.w2_weight_packed,
-                    layer.w13_weight_scale,
-                    layer.w2_weight_scale,
+                    w13_scale,
+                    w2_scale,
                     a8_a,
                     a8_b,
                     a8_w2_a,
@@ -2970,6 +3072,8 @@ def _warmup_cubic_moe_families(
                     activation_situ_linear_beta=(
                         method.moe.activation_situ_linear_beta
                     ),
+                    w13_compact_metadata=w13_compact_metadata,
+                    w2_compact_metadata=w2_compact_metadata,
                 )
                 phase_index += 1
                 if progress is not None:
@@ -2999,13 +3103,14 @@ def _warmup_cubic_moe_families(
                 intermediate_size=intermediate,
                 activation_situ_beta=method.moe.activation_situ_beta,
                 activation_situ_linear_beta=(method.moe.activation_situ_linear_beta),
+                cuda_graph_replay=tokens in graph_capture_sizes,
             )
             calibrate_cubic_moe_execution(
                 x,
                 layer.w13_weight_packed,
                 layer.w2_weight_packed,
-                layer.w13_weight_scale,
-                layer.w2_weight_scale,
+                w13_scale,
+                w2_scale,
                 gate_a,
                 gate_b,
                 down_a,
@@ -3013,6 +3118,8 @@ def _warmup_cubic_moe_families(
                 topk_weights,
                 topk_ids,
                 dynamic_a8=dynamic_a8,
+                w13_compact_metadata=w13_compact_metadata,
+                w2_compact_metadata=w2_compact_metadata,
                 **execution_common,
             )
             phase_index += 1
@@ -3028,14 +3135,16 @@ def _warmup_cubic_moe_families(
                 x,
                 layer.w13_weight_packed,
                 layer.w2_weight_packed,
-                layer.w13_weight_scale,
-                layer.w2_weight_scale,
+                w13_scale,
+                w2_scale,
                 gate_a,
                 gate_b,
                 down_a,
                 down_b,
                 topk_weights,
                 topk_ids,
+                w13_compact_metadata=w13_compact_metadata,
+                w2_compact_metadata=w2_compact_metadata,
                 **common,
             )
             phase_index += 1

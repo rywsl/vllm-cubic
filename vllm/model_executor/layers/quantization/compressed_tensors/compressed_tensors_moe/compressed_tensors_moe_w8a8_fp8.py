@@ -66,10 +66,13 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             self.weight_quant.strategy == QuantizationStrategy.TENSOR
             and self.input_quant.strategy == QuantizationStrategy.TENSOR
         )
-        per_channel = (
+        self.per_act_token_quant = (
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-            and self.input_quant.strategy == QuantizationStrategy.TOKEN
+            and bool(self.input_quant.dynamic)
+            and self.input_quant.strategy
+            in {QuantizationStrategy.TENSOR, QuantizationStrategy.TOKEN}
         )
+        per_channel = self.per_act_token_quant
         if not (per_tensor or per_channel):
             assert self.weight_quant.strategy == QuantizationStrategy.BLOCK
             self.weight_block_size = self.weight_quant.block_structure
@@ -97,7 +100,9 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             ),
         }
         weight_key = ct2vllm_weight[self.weight_quant.strategy]
-        if weight_key == kFp8Static128BlockSym:
+        if per_channel:
+            activation_key = kFp8DynamicTokenSym
+        elif weight_key == kFp8Static128BlockSym:
             activation_key = kFp8Dynamic128Sym
         else:
             activation_key = ct2vllm_act[self.input_quant.strategy]
@@ -342,15 +347,14 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             )
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
-        is_per_token = self.input_quant.strategy == QuantizationStrategy.TOKEN
         return make_fp8_moe_quant_config(
             fp8_backend=self.fp8_backend,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             a1_scale=getattr(layer, "w13_input_scale", None),
             a2_scale=getattr(layer, "w2_input_scale", None),
-            per_act_token_quant=is_per_token,
-            per_out_ch_quant=is_per_token,
+            per_act_token_quant=self.per_act_token_quant,
+            per_out_ch_quant=self.per_act_token_quant,
             block_shape=self.weight_block_size,
             swiglu_limit=getattr(layer, "swiglu_limit", None),
             layer=layer,

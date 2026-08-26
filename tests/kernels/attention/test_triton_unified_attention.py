@@ -89,11 +89,16 @@ def ref_paged_attn(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("query_len", [2, 4])
+@pytest.mark.parametrize("kv_cache_dtype", ["bfloat16", "fp8_q16"])
 @torch.inference_mode()
-def test_triton_segmented_decode_supports_two_query_tokens() -> None:
+def test_triton_segmented_decode_supports_speculative_query_tokens(
+    query_len: int,
+    kv_cache_dtype: str,
+) -> None:
     torch.set_default_device(DEVICE_TYPE)
     set_random_seed(20260820)
-    query_len, kv_len = 2, 2048
+    kv_len = 2048
     num_query_heads, num_kv_heads, head_size, block_size = 6, 1, 256, 16
     num_blocks = (kv_len + block_size - 1) // block_size
     query = torch.randn(
@@ -103,6 +108,23 @@ def test_triton_segmented_decode_supports_two_query_tokens() -> None:
         num_blocks, block_size, num_kv_heads, head_size, dtype=torch.bfloat16
     )
     value_cache = torch.randn_like(key_cache)
+    stored_key_cache = key_cache
+    stored_value_cache = value_cache
+    k_descale = None
+    v_descale = None
+    kv_quant_mode = KVQuantMode.NONE
+    if kv_cache_dtype == "fp8_q16":
+        k_descale = torch.tensor(0.5, dtype=torch.float32)
+        v_descale = torch.tensor(0.25, dtype=torch.float32)
+        stored_key_cache = (key_cache / k_descale).to(FP8_DTYPE)
+        stored_value_cache = (value_cache / v_descale).to(FP8_DTYPE)
+        key_cache = (stored_key_cache.to(torch.bfloat16) * k_descale).to(
+            torch.bfloat16
+        )
+        value_cache = (stored_value_cache.to(torch.bfloat16) * v_descale).to(
+            torch.bfloat16
+        )
+        kv_quant_mode = KVQuantMode.FP8_PER_TENSOR
     output = torch.empty_like(query)
     query_lens = torch.tensor([0, query_len], dtype=torch.int32)
     kv_lens = torch.tensor([kv_len], dtype=torch.int32)
@@ -122,8 +144,8 @@ def test_triton_segmented_decode_supports_two_query_tokens() -> None:
 
     unified_attention(
         q=query,
-        k=key_cache,
-        v=value_cache,
+        k=stored_key_cache,
+        v=stored_value_cache,
         out=output,
         cu_seqlens_q=query_lens,
         seqused_k=kv_lens,
@@ -135,14 +157,14 @@ def test_triton_segmented_decode_supports_two_query_tokens() -> None:
         block_table=block_tables,
         softcap=0.0,
         q_descale=None,
-        k_descale=None,
-        v_descale=None,
+        k_descale=k_descale,
+        v_descale=v_descale,
         seq_threshold_3D=8,
         num_par_softmax_segments=num_segments,
         softmax_segm_output=segment_output,
         softmax_segm_max=segment_max,
         softmax_segm_expsum=segment_sum,
-        kv_quant_mode=KVQuantMode.NONE,
+        kv_quant_mode=kv_quant_mode,
     )
     expected = ref_paged_attn(
         query=query.clone(),

@@ -323,6 +323,8 @@ def test_cuda_communicator_groups_independent_pynccl_all_reduces(
 ) -> None:
     communicator = CudaCommunicator.__new__(CudaCommunicator)
     communicator.pynccl_comm = Mock(disabled=False, world_size=8)
+    communicator.pynccl_simple_comm = None
+    communicator.pynccl_simple_buckets = frozenset()
     communicator.qr_comm = None
     communicator.fi_ar_comm = None
     communicator.aiter_ar_comm = None
@@ -344,6 +346,59 @@ def test_cuda_communicator_groups_independent_pynccl_all_reduces(
     assert [call.args[1] for call in calls] == outputs
     assert outputs[0].shape == inputs[0].shape
     assert outputs[1].shape == inputs[1].shape
+
+
+@pytest.mark.parametrize(
+    ("nbytes", "bucket"),
+    [
+        (1, 64 * 1024),
+        (64 * 1024, 64 * 1024),
+        (64 * 1024 + 1, 128 * 1024),
+        (768 * 1024, 768 * 1024),
+    ],
+)
+def test_cuda_communicator_pynccl_protocol_bucket(nbytes: int, bucket: int) -> None:
+    assert CudaCommunicator._pynccl_protocol_bucket(nbytes) == bucket
+
+
+def test_cuda_communicator_selects_pynccl_protocol_by_message_size() -> None:
+    communicator = CudaCommunicator.__new__(CudaCommunicator)
+    communicator.pynccl_comm = Mock()
+    communicator.pynccl_simple_comm = Mock()
+    communicator.pynccl_simple_buckets = frozenset({128 * 1024})
+
+    selected = communicator._select_pynccl_comm(torch.empty(32 * 1024))
+    default = communicator._select_pynccl_comm(torch.empty(64 * 1024))
+
+    assert selected is communicator.pynccl_simple_comm
+    assert default is communicator.pynccl_comm
+
+
+def test_cuda_communicator_splits_mixed_protocol_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    communicator = CudaCommunicator.__new__(CudaCommunicator)
+    communicator.pynccl_comm = Mock(disabled=False, world_size=8)
+    communicator.pynccl_simple_comm = Mock(disabled=False, world_size=8)
+    communicator.pynccl_simple_buckets = frozenset({64 * 1024})
+    communicator.qr_comm = None
+    communicator.fi_ar_comm = None
+    communicator.aiter_ar_comm = None
+    communicator.ca_comm = None
+    communicator.symm_mem_comm = None
+    monkeypatch.setattr(
+        "vllm.distributed.device_communicators.cuda_communicator."
+        "should_nccl_symm_mem_allreduce",
+        lambda *_: False,
+    )
+    inputs = [torch.empty(16 * 1024), torch.empty(32 * 1024)]
+
+    communicator.all_reduce_batch(inputs)
+
+    communicator.pynccl_simple_comm.group_start.assert_not_called()
+    communicator.pynccl_comm.group_start.assert_not_called()
+    communicator.pynccl_simple_comm.all_reduce.assert_called_once()
+    communicator.pynccl_comm.all_reduce.assert_called_once()
 
 
 def test_async_intermediate_tensors_lazy_wait() -> None:
