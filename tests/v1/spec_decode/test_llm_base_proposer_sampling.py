@@ -14,6 +14,7 @@ from vllm.v1.spec_decode.llm_base_proposer import (
     SpecDecodeBaseProposer,
     compute_probs_and_sample_next_token,
 )
+from vllm.v1.spec_decode.utils import resolve_local_argmax_reduction
 
 DEVICE_TYPE = current_platform.device_type
 
@@ -90,3 +91,29 @@ def test_mtp_model_returns_tuple(architecture: str, expected: bool):
     )
 
     assert proposer.model_returns_tuple() is expected
+
+
+@pytest.mark.parametrize(
+    ("requested", "draft_sample_method", "supports_local_argmax", "expected"),
+    [
+        (None, "greedy", True, True),
+        (None, "greedy", False, False),
+        (None, "probabilistic", True, False),
+        (True, "probabilistic", False, True),
+        (False, "greedy", True, False),
+    ],
+)
+def test_resolve_local_argmax_reduction(
+    requested: bool | None,
+    draft_sample_method: str,
+    supports_local_argmax: bool,
+    expected: bool,
+):
+    model = SimpleNamespace()
+    if supports_local_argmax:
+        model.get_top_tokens = lambda hidden_states: hidden_states
+
+    assert (
+        resolve_local_argmax_reduction(requested, draft_sample_method, model)
+        is expected
+    )

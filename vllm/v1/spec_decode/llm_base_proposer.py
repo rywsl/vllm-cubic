@@ -59,6 +59,7 @@ from vllm.v1.spec_decode.utils import (
     eagle_step_update_slot_mapping_and_metadata,
     extend_all_queries_by_N,
     next_power_of_2,
+    resolve_local_argmax_reduction,
 )
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
@@ -128,7 +129,7 @@ class SpecDecodeBaseProposer:
         self.parallel_drafting_hidden_state_tensor: torch.Tensor | None = None
         if self.parallel_drafting:
             self._init_parallel_drafting_params()
-        self.use_local_argmax_reduction: bool = (
+        self.use_local_argmax_reduction: bool | None = (
             self.speculative_config.use_local_argmax_reduction
         )
         self.use_fp64_gumbel = vllm_config.model_config.use_fp64_gumbel
@@ -1339,6 +1340,11 @@ class SpecDecodeBaseProposer:
         )
 
         self.model = self._get_model()
+        self.use_local_argmax_reduction = resolve_local_argmax_reduction(
+            self.use_local_argmax_reduction,
+            self.speculative_config.draft_sample_method,
+            self.model,
+        )
 
         # Find draft layers (attention layers added by draft model)
         all_attn_layers = get_layers_from_vllm_config(

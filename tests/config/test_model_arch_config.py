@@ -182,6 +182,22 @@ def test_legacy_modelopt_config_without_producer_is_normalized():
     assert convertor.get_quantization_config()["quant_method"] == "modelopt_fp4"
 
 
+def test_compressed_tensors_config_groups_infer_quant_method():
+    quantization_config = {
+        "format": "mixed-precision",
+        "config_groups": {"nvfp4": {"targets": ["model.layers.0.mlp"]}},
+    }
+    text_config = PretrainedConfig(quantization_config=quantization_config)
+    hf_config = PretrainedConfig(text_config=text_config)
+
+    convertor = ModelArchConfigConvertorBase(hf_config, text_config)
+
+    assert (
+        convertor.get_quantization_config()["quant_method"]
+        == "compressed-tensors"
+    )
+
+
 @pytest.mark.parametrize("model", BASE_MODELS_TO_TEST)
 def test_base_model_arch_config(model: str):
     """Test model architecture config for base models."""

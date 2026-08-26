@@ -30,8 +30,13 @@ import torch
 
 from vllm.model_executor.layers.mamba import mamba_utils as layer_mamba_utils
 from vllm.platforms import current_platform
+from vllm.triton_utils import triton
 from vllm.v1.worker import mamba_utils as worker_mamba_utils
-from vllm.v1.worker.mamba_utils import precopy_mamba_align_fused_kernel
+from vllm.v1.worker.mamba_utils import (
+    precopy_mamba_align_fused_kernel,
+    prepare_mamba_align_precopy_kernel,
+    remap_mamba_accepted_tokens_kernel,
+)
 
 _parametrize: Callable[..., Callable[[Any], Any]]
 
@@ -410,6 +415,47 @@ def test_preprocess_fused_align_matches_scalar_bookkeeping(monkeypatch, token_bi
         if int(src) != -1 and int(src) != int(dst)
     ]
     assert fused_copy_calls == scalar_copy_calls
+
+
+@_cuda_required
+@_parametrize("num_reqs", [1, 7, 257])
+def test_gpu_resident_align_accepted_count_bookkeeping(num_reqs):
+    device = torch.device("cuda")
+    previous = torch.randint(1, 5, (512,), dtype=torch.int32, device=device)
+    positions = torch.randint(-1, 512, (num_reqs,), device=device)
+    current = torch.empty(num_reqs, dtype=torch.int32, device=device)
+    block = 256
+    remap_mamba_accepted_tokens_kernel[(triton.cdiv(num_reqs, block),)](
+        previous,
+        positions,
+        current,
+        num_reqs,
+        BLOCK_SIZE=block,
+    )
+    expected = torch.where(
+        positions >= 0,
+        previous[positions.clamp_min(0)],
+        torch.ones_like(positions, dtype=torch.int32),
+    )
+    torch.testing.assert_close(current, expected, rtol=0, atol=0)
+
+    src_col = torch.randint(-1, 8, (num_reqs,), dtype=torch.int32, device=device)
+    before_reset = current.clone()
+    token_bias = torch.empty_like(current)
+    prepare_mamba_align_precopy_kernel[(triton.cdiv(num_reqs, block),)](
+        src_col,
+        current,
+        token_bias,
+        num_reqs,
+        BLOCK_SIZE=block,
+    )
+    torch.testing.assert_close(token_bias, before_reset - 1, rtol=0, atol=0)
+    torch.testing.assert_close(
+        current,
+        torch.where(src_col >= 0, torch.ones_like(current), before_reset),
+        rtol=0,
+        atol=0,
+    )
 
 
 if __name__ == "__main__":

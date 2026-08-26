@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import os
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import Any
@@ -261,6 +262,40 @@ def _decode_cubic_moe_e5m9_curve2_metadata(
     a = selected_a.gather(2, curve_id)
     b = selected_b.gather(2, curve_id)
     return scale, a, b
+
+
+def _decode_cubic_moe_compact_metadata(
+    scale_code: torch.Tensor,
+    packed_ab: torch.Tensor,
+    scale_global: torch.Tensor,
+    a_global: torch.Tensor,
+    b_global: torch.Tensor,
+    output_partition_sizes: tuple[int, ...],
+    group_out: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if scale_code.dtype != torch.int8:
+        raise ValueError("Cubic MoE compact scale codes must remain INT8.")
+    if packed_ab.dtype != torch.uint8:
+        raise ValueError("Cubic MoE compact a/b codes must remain uint8.")
+    output_groups = tuple(size // group_out for size in output_partition_sizes)
+    partition = torch.repeat_interleave(
+        torch.arange(len(output_groups), device=scale_code.device),
+        torch.tensor(output_groups, device=scale_code.device),
+    )
+
+    def select_global(value: torch.Tensor) -> torch.Tensor:
+        if value.dtype != torch.float32:
+            raise ValueError("Cubic MoE compact globals must remain FP32.")
+        if value.shape != (scale_code.shape[0], len(output_partition_sizes)):
+            raise ValueError("Cubic MoE compact globals have an invalid shape.")
+        return value[:, partition, None]
+
+    signed_a = (packed_ab.to(torch.int8) << 4) >> 4
+    signed_b = packed_ab.to(torch.int8) >> 4
+    scale = scale_code.float() * select_global(scale_global)
+    a = 1.0 + signed_a.float() * select_global(a_global)
+    b = signed_b.float() * select_global(b_global)
+    return scale, a.half(), b.half()
 
 
 def expanded_cubic_metadata(
@@ -1452,8 +1487,6 @@ class CubicConfig(QuantizationConfig):
                 else UnquantizedLinearMethod()
             )
         if isinstance(layer, RoutedExperts):
-            if scheme and scheme.metadata_format == CUBIC_COMPACT_METADATA_FORMAT:
-                raise ValueError("INT8/INT4 compact metadata is unsupported by MoE.")
             return (
                 CubicMoEMethod(
                     scheme,
@@ -2254,13 +2287,23 @@ class CubicMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs: Any,
     ) -> None:
-        group_size = self.scheme.group_size
+        checkpoint_group_size = self.scheme.group_size
+        group_size = checkpoint_group_size
         group_out = self.scheme.group_out
-        if hidden_size % group_size or intermediate_size_per_partition % group_size:
+        if hidden_size % checkpoint_group_size:
             raise ValueError(
-                "Cubic fused MoE requires hidden and per-partition intermediate "
-                f"sizes to be divisible by group_size={group_size}."
+                "Cubic fused MoE requires hidden_size to be divisible by "
+                f"checkpoint group_size={checkpoint_group_size}."
             )
+        if intermediate_size_per_partition % checkpoint_group_size:
+            if checkpoint_group_size % intermediate_size_per_partition:
+                raise ValueError(
+                    "Cubic fused MoE cannot align checkpoint group_size="
+                    f"{checkpoint_group_size} with TP-local intermediate_size="
+                    f"{intermediate_size_per_partition}."
+                )
+            group_size = intermediate_size_per_partition
+        metadata_group_repeat = checkpoint_group_size // group_size
         w13_output = (
             2 * intermediate_size_per_partition
             if self.moe.is_act_and_mul
@@ -2280,6 +2323,8 @@ class CubicMoEMethod(FusedMoEMethodBase):
             name: str,
             data: torch.Tensor,
             expected_shards: tuple[str, ...],
+            *,
+            repeat_input_groups: int = 1,
         ) -> None:
             marker = torch.zeros(
                 (num_experts, len(expected_shards)),
@@ -2296,6 +2341,10 @@ class CubicMoEMethod(FusedMoEMethodBase):
                 expert_id: int,
                 return_success: bool = False,
             ) -> bool | None:
+                if repeat_input_groups > 1:
+                    loaded_weight = loaded_weight.repeat_interleave(
+                        repeat_input_groups, dim=-1
+                    )
                 success = weight_loader(
                     param=param,
                     loaded_weight=loaded_weight,
@@ -2364,6 +2413,69 @@ class CubicMoEMethod(FusedMoEMethodBase):
                 {**attrs, "weight_loader": curve_weight_loader},
             )
 
+        def register_globals(
+            name: str,
+            logical_shards: tuple[str, ...],
+        ) -> None:
+            marker = torch.zeros(
+                (num_experts, len(logical_shards)), dtype=torch.bool, device="cpu"
+            )
+            loaded_shards[name] = marker
+
+            def global_weight_loader(
+                param: torch.nn.Parameter,
+                loaded_weight: torch.Tensor,
+                weight_name: str,
+                shard_id: str,
+                expert_id: int,
+                return_success: bool = False,
+            ) -> bool | None:
+                del weight_name
+                shard = logical_shards.index(shard_id)
+                if loaded_weight.ndim == 2:
+                    if loaded_weight.shape[1] != len(logical_shards):
+                        raise ValueError(
+                            "Cubic MoE compact global metadata has an invalid shape."
+                        )
+                    for global_expert_id, values in enumerate(loaded_weight):
+                        local_expert_id = (
+                            layer._map_global_expert_id_to_local_expert_id(
+                                global_expert_id
+                            )
+                        )
+                        if local_expert_id != -1:
+                            param.data[local_expert_id, shard].copy_(values[shard])
+                            marker[local_expert_id, shard] = True
+                    return True if return_success else None
+
+                local_expert_id = layer._map_global_expert_id_to_local_expert_id(
+                    expert_id
+                )
+                if local_expert_id == -1:
+                    return False if return_success else None
+                value = loaded_weight.reshape(-1)
+                if value.numel() != 1:
+                    raise ValueError(
+                        "Cubic MoE compact global metadata must be scalar per shard."
+                    )
+                param.data[local_expert_id, shard].copy_(value[0])
+                marker[local_expert_id, shard] = True
+                return True if return_success else None
+
+            param = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    len(logical_shards),
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter(name, param)
+            set_weight_attrs(
+                param,
+                {**attrs, "weight_loader": global_weight_loader},
+            )
+
         register(
             "w13_weight_packed",
             torch.empty(
@@ -2399,27 +2511,49 @@ class CubicMoEMethod(FusedMoEMethodBase):
                     f"{prefix}_weight_metadata",
                     torch.empty(metadata_shape, dtype=torch.uint16),
                     logical_shards,
+                    repeat_input_groups=metadata_group_repeat,
                 )
                 register_curves(f"{prefix}_weight_curve_a", logical_shards)
                 register_curves(f"{prefix}_weight_curve_b", logical_shards)
+            elif self.scheme.metadata_format == CUBIC_COMPACT_METADATA_FORMAT:
+                register(
+                    f"{prefix}_weight_scale",
+                    torch.empty(metadata_shape, dtype=torch.int8),
+                    logical_shards,
+                    repeat_input_groups=metadata_group_repeat,
+                )
+                register(
+                    f"{prefix}_weight_ab",
+                    torch.empty(metadata_shape, dtype=torch.uint8),
+                    logical_shards,
+                    repeat_input_groups=metadata_group_repeat,
+                )
+                for suffix in ("scale", "a", "b"):
+                    register_globals(
+                        f"{prefix}_weight_{suffix}_global", logical_shards
+                    )
             else:
                 register(
                     f"{prefix}_weight_scale",
                     torch.empty(metadata_shape, dtype=torch.float32),
                     logical_shards,
+                    repeat_input_groups=metadata_group_repeat,
                 )
                 register(
                     f"{prefix}_weight_a",
                     torch.empty(metadata_shape, dtype=torch.float16),
                     logical_shards,
+                    repeat_input_groups=metadata_group_repeat,
                 )
                 register(
                     f"{prefix}_weight_b",
                     torch.empty(metadata_shape, dtype=torch.float16),
                     logical_shards,
+                    repeat_input_groups=metadata_group_repeat,
                 )
         layer.cubic_hidden_size = hidden_size
         layer.cubic_intermediate_size = intermediate_size_per_partition
+        layer.cubic_runtime_group_size = group_size
         layer.cubic_weight_loader = weight_loader
         layer.cubic_loaded_shards = loaded_shards
         layer.cubic_fused_checkpoint_layout = True
@@ -2446,12 +2580,12 @@ class CubicMoEMethod(FusedMoEMethodBase):
         expected_w13_metadata = (
             layer.w13_weight_packed.shape[0],
             layer.w13_weight_packed.shape[1] // self.scheme.group_out,
-            layer.cubic_hidden_size // self.scheme.group_size,
+            layer.cubic_hidden_size // layer.cubic_runtime_group_size,
         )
         expected_w2_metadata = (
             layer.w2_weight_packed.shape[0],
             layer.w2_weight_packed.shape[1] // self.scheme.group_out,
-            layer.cubic_intermediate_size // self.scheme.group_size,
+            layer.cubic_intermediate_size // layer.cubic_runtime_group_size,
         )
         if self.scheme.metadata_format == CUBIC_E5M9_CURVE2_METADATA_FORMAT:
             w13_metadata = layer.w13_weight_metadata
@@ -2464,51 +2598,241 @@ class CubicMoEMethod(FusedMoEMethodBase):
             or tuple(w2_metadata.shape) != expected_w2_metadata
         ):
             raise ValueError("Cubic fused MoE metadata has an invalid group count.")
-        if self.scheme.metadata_format == CUBIC_E5M9_CURVE2_METADATA_FORMAT:
-            w13_scale, w13_a, w13_b = _decode_cubic_moe_e5m9_curve2_metadata(
-                layer.w13_weight_metadata,
-                layer.w13_weight_curve_a,
-                layer.w13_weight_curve_b,
-                (
-                    layer.cubic_intermediate_size,
-                    layer.cubic_intermediate_size,
-                ),
-                self.scheme.group_out,
-            )
-            w2_scale, w2_a, w2_b = _decode_cubic_moe_e5m9_curve2_metadata(
-                layer.w2_weight_metadata,
-                layer.w2_weight_curve_a,
-                layer.w2_weight_curve_b,
-                (layer.cubic_hidden_size,),
-                self.scheme.group_out,
-            )
-            for name, value in (
-                ("w13_weight_scale", w13_scale),
-                ("w13_weight_a", w13_a),
-                ("w13_weight_b", w13_b),
-                ("w2_weight_scale", w2_scale),
-                ("w2_weight_a", w2_a),
-                ("w2_weight_b", w2_b),
-            ):
-                layer.register_buffer(name, value)
-        if layer.w13_weight_scale.dtype != torch.float32:
-            raise ValueError("Cubic fused MoE scale must remain FP32 at runtime.")
-        if layer.w2_weight_scale.dtype != torch.float32:
-            raise ValueError("Cubic fused MoE scale must remain FP32 at runtime.")
-        metadata_pairs = (
-            (layer.w13_weight_a, layer.w13_weight_b),
-            (layer.w2_weight_a, layer.w2_weight_b),
-        )
-        if self.dynamic_a8 and self.scheme.num_bits == 3:
-            for a, b in metadata_pairs:
-                _prepare_3bit_carrier_metadata(a, b)
+        if self.scheme.metadata_format == CUBIC_COMPACT_METADATA_FORMAT:
+            for prefix in ("w13", "w2"):
+                if getattr(layer, f"{prefix}_weight_scale").dtype != torch.int8:
+                    raise ValueError("Cubic MoE compact scale must remain INT8.")
+                if getattr(layer, f"{prefix}_weight_ab").dtype != torch.uint8:
+                    raise ValueError("Cubic MoE compact a/b must remain uint8.")
+                for suffix in ("scale", "a", "b"):
+                    if (
+                        getattr(layer, f"{prefix}_weight_{suffix}_global").dtype
+                        != torch.float32
+                    ):
+                        raise ValueError(
+                            "Cubic MoE compact globals must remain FP32."
+                        )
+        elif self.scheme.metadata_format == CUBIC_E5M9_CURVE2_METADATA_FORMAT:
+            for prefix in ("w13", "w2"):
+                if getattr(layer, f"{prefix}_weight_metadata").dtype != torch.uint16:
+                    raise ValueError("Cubic MoE E5M9 metadata must remain uint16.")
+                for suffix in ("a", "b"):
+                    curve = getattr(layer, f"{prefix}_weight_curve_{suffix}")
+                    if curve.dtype != torch.float16 or curve.shape[-1] != 4:
+                        raise ValueError(
+                            "Cubic MoE Curve2 tables must remain FP16 [..., 4]."
+                        )
         else:
-            for a, b in metadata_pairs:
-                if a.dtype != torch.float16 or b.dtype != torch.float16:
-                    raise ValueError("Cubic fused MoE a/b must remain FP16.")
+            if layer.w13_weight_scale.dtype != torch.float32:
+                raise ValueError("Cubic fused MoE scale must remain FP32 at runtime.")
+            if layer.w2_weight_scale.dtype != torch.float32:
+                raise ValueError("Cubic fused MoE scale must remain FP32 at runtime.")
+            metadata_pairs = (
+                (layer.w13_weight_a, layer.w13_weight_b),
+                (layer.w2_weight_a, layer.w2_weight_b),
+            )
+            if self.dynamic_a8 and self.scheme.num_bits == 3:
+                for a, b in metadata_pairs:
+                    _prepare_3bit_carrier_metadata(a, b)
+            else:
+                for a, b in metadata_pairs:
+                    if a.dtype != torch.float16 or b.dtype != torch.float16:
+                        raise ValueError("Cubic fused MoE a/b must remain FP16.")
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> None:
         return None
+
+    def runtime_metadata(
+        self, layer: RoutedExperts
+    ) -> tuple[torch.Tensor, ...]:
+        from vllm.model_executor.layers.quantization.cubic_kernels import (
+            CubicMoECompactMetadata,
+        )
+
+        if self.scheme.metadata_format == CUBIC_COMPACT_METADATA_FORMAT:
+            w13_scale = layer.w13_weight_scale
+            w2_scale = layer.w2_weight_scale
+            w13_a = w13_b = layer.w13_weight_ab
+            w2_a = w2_b = layer.w2_weight_ab
+            w13_compact_metadata = CubicMoECompactMetadata(
+                w13_scale,
+                w13_a,
+                w13_b,
+                layer.w13_weight_scale_global,
+                layer.w13_weight_a_global,
+                layer.w13_weight_b_global,
+                1,
+                layer.cubic_intermediate_size,
+                2,
+            )
+            w2_compact_metadata = CubicMoECompactMetadata(
+                w2_scale,
+                w2_a,
+                w2_b,
+                layer.w2_weight_scale_global,
+                layer.w2_weight_a_global,
+                layer.w2_weight_b_global,
+                1,
+                layer.cubic_hidden_size,
+                1,
+            )
+        elif self.scheme.metadata_format == CUBIC_E5M9_CURVE2_METADATA_FORMAT:
+            w13_scale = layer.w13_weight_metadata
+            w2_scale = layer.w2_weight_metadata
+            w13_a = layer.w13_weight_curve_a
+            w13_b = layer.w13_weight_curve_b
+            w2_a = layer.w2_weight_curve_a
+            w2_b = layer.w2_weight_curve_b
+            w13_compact_metadata = CubicMoECompactMetadata(
+                w13_scale,
+                w13_a,
+                w13_b,
+                w13_a,
+                w13_a,
+                w13_b,
+                2,
+                layer.cubic_intermediate_size,
+                2,
+            )
+            w2_compact_metadata = CubicMoECompactMetadata(
+                w2_scale,
+                w2_a,
+                w2_b,
+                w2_a,
+                w2_a,
+                w2_b,
+                2,
+                layer.cubic_hidden_size,
+                1,
+            )
+        else:
+            w13_scale = layer.w13_weight_scale
+            w2_scale = layer.w2_weight_scale
+            w13_a = layer.w13_weight_a
+            w13_b = layer.w13_weight_b
+            w2_a = layer.w2_weight_a
+            w2_b = layer.w2_weight_b
+            w13_compact_metadata = None
+            w2_compact_metadata = None
+        return (
+            w13_scale,
+            w2_scale,
+            w13_a,
+            w13_b,
+            w2_a,
+            w2_b,
+            w13_compact_metadata,
+            w2_compact_metadata,
+        )
+
+    def _performance_probe_group_shape(
+        self, base_group_size: int | None = None
+    ) -> tuple[int, int]:
+        if base_group_size is None:
+            base_group_size = self.scheme.group_size
+        if os.getenv("VLLM_CUBIC_PERF_PROBE_128X512") == "1":
+            target_group_size = 512
+            target_group_out = 128
+        else:
+            target_group_size = int(
+                os.getenv("VLLM_CUBIC_PERF_PROBE_GROUP_IN", "0")
+            )
+            target_group_out = int(
+                os.getenv("VLLM_CUBIC_PERF_PROBE_GROUP_OUT", "0")
+            )
+        if target_group_size == 0 and target_group_out == 0:
+            return base_group_size, self.scheme.group_out
+        if target_group_size == 0:
+            target_group_size = base_group_size
+        if target_group_out == 0:
+            target_group_out = self.scheme.group_out
+        if (
+            self.scheme.group_out != 1
+            or target_group_size % base_group_size
+            or target_group_out < self.scheme.group_out
+        ):
+            return base_group_size, self.scheme.group_out
+        return target_group_size, target_group_out
+
+    def _performance_probe_metadata(
+        self,
+        layer: RoutedExperts,
+        name: str,
+        metadata: Any,
+    ) -> Any:
+        base_group_size = layer.cubic_runtime_group_size
+        group_size, group_out = self._performance_probe_group_shape(base_group_size)
+        if metadata is None or (group_size, group_out) == (
+            base_group_size,
+            self.scheme.group_out,
+        ):
+            return metadata
+        cache_name = f"_cubic_performance_probe_{name}"
+        cached = getattr(layer, cache_name, None)
+        if cached is not None:
+            return cached
+        group_stride = group_size // base_group_size
+
+        output_stride = group_out // self.scheme.group_out
+
+        def folded(value: torch.Tensor) -> torch.Tensor:
+            return value[:, ::output_stride, ::group_stride].contiguous()
+
+        folded_metadata = metadata._replace(
+            primary=folded(metadata.primary),
+            secondary=(
+                folded(metadata.secondary)
+                if metadata.format == 1
+                else metadata.secondary
+            ),
+            tertiary=(
+                folded(metadata.tertiary)
+                if metadata.format == 1
+                else metadata.tertiary
+            ),
+        )
+        setattr(layer, cache_name, folded_metadata)
+        return folded_metadata
+
+    def _with_compact_codebook(
+        self,
+        layer: RoutedExperts,
+        name: str,
+        metadata: Any,
+    ) -> Any:
+        if os.getenv("VLLM_CUBIC_EXPERIMENTAL_COMPACT_CODEBOOK") != "1":
+            return metadata
+        if metadata is None or metadata.format != 1:
+            return metadata
+        cache_name = f"_cubic_compact_codebook_{name}"
+        cached = getattr(layer, cache_name, None)
+        if cached is not None:
+            return cached
+        levels = 1 << (self.scheme.num_bits - 1)
+        ab = torch.arange(256, device=metadata.a_global.device, dtype=torch.int16)
+        a_code = ab & 0xF
+        b_code = ab >> 4
+        a_code = torch.where(a_code >= 8, a_code - 16, a_code).float()
+        b_code = torch.where(b_code >= 8, b_code - 16, b_code).float()
+        cubic_a = (
+            1.0 + metadata.a_global[..., None] * a_code
+        ).half().float()
+        cubic_b = (metadata.b_global[..., None] * b_code).half().float()
+        t = torch.arange(
+            levels,
+            device=metadata.a_global.device,
+            dtype=torch.float32,
+        ) / (levels - 1)
+        t = t.view(1, 1, 1, levels)
+        cubic_a = cubic_a[..., None]
+        cubic_b = cubic_b[..., None]
+        normalized = t * (
+            cubic_a + t * (cubic_b + t * (1.0 - cubic_a - cubic_b))
+        )
+        codebook = torch.round(normalized * 127.0).to(torch.int8).contiguous()
+        cached = metadata._replace(tertiary=codebook, format=3)
+        setattr(layer, cache_name, cached)
+        return cached
 
     def apply(
         self,
@@ -2524,20 +2848,48 @@ class CubicMoEMethod(FusedMoEMethodBase):
             cubic_fused_moe_dynamic_a8,
         )
 
+        (
+            w13_scale,
+            w2_scale,
+            w13_a,
+            w13_b,
+            w2_a,
+            w2_b,
+            w13_compact_metadata,
+            w2_compact_metadata,
+        ) = self.runtime_metadata(layer)
+        w13_compact_metadata = self._performance_probe_metadata(
+            layer,
+            "w13",
+            w13_compact_metadata
+        )
+        w2_compact_metadata = self._performance_probe_metadata(
+            layer, "w2", w2_compact_metadata
+        )
+        w13_compact_metadata = self._with_compact_codebook(
+            layer, "w13", w13_compact_metadata
+        )
+        w2_compact_metadata = self._with_compact_codebook(
+            layer, "w2", w2_compact_metadata
+        )
+        runtime_group_size, runtime_group_out = self._performance_probe_group_shape(
+            layer.cubic_runtime_group_size
+        )
+
         args = (
             x,
             layer.w13_weight_packed,
             layer.w2_weight_packed,
-            layer.w13_weight_scale,
-            layer.w2_weight_scale,
-            layer.w13_weight_a,
-            layer.w13_weight_b,
-            layer.w2_weight_a,
-            layer.w2_weight_b,
+            w13_scale,
+            w2_scale,
+            w13_a,
+            w13_b,
+            w2_a,
+            w2_b,
             topk_weights,
             topk_ids,
         )
-        if torch.compiler.is_compiling():
+        if torch.compiler.is_compiling() and w13_compact_metadata is None:
             op = (
                 torch.ops.vllm.cubic_fused_moe_dynamic_a8
                 if self.dynamic_a8
@@ -2550,7 +2902,7 @@ class CubicMoEMethod(FusedMoEMethodBase):
                 layer.apply_router_weight_on_input,
                 layer.global_num_experts,
                 self.scheme.num_bits,
-                self.scheme.group_size,
+                layer.cubic_runtime_group_size,
                 self.scheme.group_out,
                 layer.cubic_hidden_size,
                 layer.cubic_intermediate_size,
@@ -2565,12 +2917,14 @@ class CubicMoEMethod(FusedMoEMethodBase):
             global_num_experts=layer.global_num_experts,
             expert_map=layer.expert_map,
             num_bits=self.scheme.num_bits,
-            group_size=self.scheme.group_size,
-            group_out=self.scheme.group_out,
+            group_size=runtime_group_size,
+            group_out=runtime_group_out,
             hidden_size=layer.cubic_hidden_size,
             intermediate_size=layer.cubic_intermediate_size,
             activation_situ_beta=self.moe.activation_situ_beta,
             activation_situ_linear_beta=self.moe.activation_situ_linear_beta,
+            w13_compact_metadata=w13_compact_metadata,
+            w2_compact_metadata=w2_compact_metadata,
         )
 
     def apply_monolithic(

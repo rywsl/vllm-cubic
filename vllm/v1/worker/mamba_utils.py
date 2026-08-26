@@ -324,6 +324,54 @@ def preprocess_mamba_align_fused_kernel(
 
 
 @triton.jit(do_not_specialize=["num_reqs"])
+def remap_mamba_accepted_tokens_kernel(
+    previous_tokens_ptr,
+    previous_positions_ptr,
+    current_tokens_ptr,
+    num_reqs,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_reqs
+    previous_positions = tl.load(
+        previous_positions_ptr + offsets, mask=mask, other=-1
+    )
+    previous_tokens = tl.load(
+        previous_tokens_ptr + tl.maximum(previous_positions, 0),
+        mask=mask & (previous_positions >= 0),
+        other=1,
+    )
+    tl.store(current_tokens_ptr + offsets, previous_tokens, mask=mask)
+
+
+@triton.jit(do_not_specialize=["num_reqs"])
+def prepare_mamba_align_precopy_kernel(
+    src_col_ptr,
+    num_accepted_tokens_ptr,
+    token_bias_ptr,
+    num_reqs,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_reqs
+    src_col = tl.load(src_col_ptr + offsets, mask=mask, other=-1)
+    num_accepted = tl.load(
+        num_accepted_tokens_ptr + offsets, mask=mask, other=1
+    )
+    tl.store(
+        token_bias_ptr + offsets,
+        tl.maximum(num_accepted - 1, 0),
+        mask=mask,
+    )
+    crosses_boundary = src_col >= 0
+    tl.store(
+        num_accepted_tokens_ptr + offsets,
+        1,
+        mask=mask & crosses_boundary,
+    )
+
+
+@triton.jit(do_not_specialize=["num_reqs"])
 def precopy_mamba_align_fused_kernel(
     # Per-request-slot inputs (indexed by req_idx via idx_mapping), produced by
     # the V2 fused align preprocess kernel for the current step:
@@ -797,6 +845,43 @@ class MambaSpecDecodeGPUContext:
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
         )
 
+    def remap_accepted_tokens(
+        self,
+        num_reqs: int,
+        previous_positions: torch.Tensor,
+        current_tokens: torch.Tensor,
+    ) -> None:
+        """Gather the previous batch's accepted counts into current row order."""
+        if num_reqs == 0:
+            return
+        block = 256
+        remap_mamba_accepted_tokens_kernel[(triton.cdiv(num_reqs, block),)](
+            self.num_accepted_tokens_out,
+            previous_positions,
+            current_tokens,
+            num_reqs,
+            BLOCK_SIZE=block,
+        )
+
+    def prepare_fused_precopy(
+        self,
+        num_reqs: int,
+        src_col_gpu: torch.Tensor,
+        num_accepted_tokens_gpu: torch.Tensor,
+    ) -> None:
+        """Build copy offsets and reset boundary-crossing rows on the GPU."""
+        if num_reqs == 0:
+            return
+        assert self.precopy_token_bias_buf is not None
+        block = 256
+        prepare_mamba_align_precopy_kernel[(triton.cdiv(num_reqs, block),)](
+            src_col_gpu,
+            num_accepted_tokens_gpu,
+            self.precopy_token_bias_buf.gpu,
+            num_reqs,
+            BLOCK_SIZE=block,
+        )
+
     def run_fused_precopy(
         self,
         num_reqs: int,
@@ -1046,6 +1131,7 @@ def preprocess_mamba(
     mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
     copy_bufs: MambaCopyBuffers,
     align_ctx: MambaSpecDecodeGPUContext | None = None,
+    num_accepted_tokens_gpu: torch.Tensor | None = None,
 ):
     """
     Copy the mamba state of previous step to the last
@@ -1108,12 +1194,14 @@ def preprocess_mamba(
             fused.state_idx.np[i] = curr_state_idx
 
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
-            accept_token_bias = int(input_batch.num_accepted_tokens_cpu[i]) - 1
             if fused is not None:
-                assert accept_token_bias >= 0
                 fused.src_col.np[i] = prev_state_idx
-                fused.token_bias.np[i] = accept_token_bias
+                if num_accepted_tokens_gpu is None:
+                    fused.token_bias.np[i] = (
+                        int(input_batch.num_accepted_tokens_cpu[i]) - 1
+                    )
             else:
+                accept_token_bias = int(input_batch.num_accepted_tokens_cpu[i]) - 1
                 collect_mamba_copy_meta(
                     copy_bufs,
                     kv_cache_config,
@@ -1125,12 +1213,20 @@ def preprocess_mamba(
                     req_state,
                     forward_context,
                 )
-            input_batch.num_accepted_tokens_cpu[i] = 1
+            if num_accepted_tokens_gpu is None:
+                input_batch.num_accepted_tokens_cpu[i] = 1
 
     if fused is not None:
         fused.state_idx.copy_to_gpu(num_reqs)
         fused.src_col.copy_to_gpu(num_reqs)
-        fused.token_bias.copy_to_gpu(num_reqs)
+        if num_accepted_tokens_gpu is None:
+            fused.token_bias.copy_to_gpu(num_reqs)
+        else:
+            fused.ctx.prepare_fused_precopy(
+                num_reqs,
+                fused.src_col.gpu,
+                num_accepted_tokens_gpu,
+            )
         fused.ctx.run_fused_precopy(
             num_reqs=num_reqs,
             state_idx_gpu=fused.state_idx.gpu,

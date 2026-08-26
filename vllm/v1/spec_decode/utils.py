@@ -11,6 +11,18 @@ from vllm.v1.attention.backends.utils import (
 PADDING_SLOT_ID = -1
 
 
+def resolve_local_argmax_reduction(
+    requested: bool | None,
+    draft_sample_method: str,
+    model: object,
+) -> bool:
+    if requested is not None:
+        return requested
+    return draft_sample_method != "probabilistic" and hasattr(
+        model, "get_top_tokens"
+    )
+
+
 def next_power_of_2(n: int) -> int:
     """Return the smallest power of 2 >= n."""
     if n <= 0:
