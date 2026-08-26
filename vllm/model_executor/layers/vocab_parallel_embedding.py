@@ -77,6 +77,9 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_, layer.weight)
 
+    def dequantize_weight(self, layer: torch.nn.Module) -> torch.Tensor:
+        return layer.weight
+
     def tie_weights(
         self, layer: torch.nn.Module, embed_tokens: "VocabParallelEmbedding"
     ):
@@ -338,6 +341,14 @@ class VocabParallelEmbedding(PluggableLayer):
             if isinstance(param, BasevLLMParameter):
                 param.tp_rank = self.tp_rank
                 param.tp_size = self.tp_size
+
+    def dequantized_weight(self) -> torch.Tensor:
+        dequantize = getattr(self.quant_method, "dequantize_weight", None)
+        if dequantize is None:
+            raise NotImplementedError(
+                f"{type(self.quant_method).__name__} cannot expose embedding weights"
+            )
+        return dequantize(self)
 
     @classmethod
     def _get_indices(

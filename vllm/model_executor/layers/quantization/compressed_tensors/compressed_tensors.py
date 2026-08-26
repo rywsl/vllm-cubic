@@ -32,6 +32,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_embedding import (  # noqa: E501
+    CompressedTensorsEmbeddingW8A16Fp8,
     CompressedTensorsEmbeddingWNA16Int,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
@@ -180,6 +181,10 @@ class CompressedTensorsConfig(QuantizationConfig):
         if isinstance(layer, ParallelLMHead):
             try:
                 quant_scheme = self.get_scheme(layer=layer, layer_name=prefix)
+                if quant_scheme is None and "." in prefix:
+                    quant_scheme = self.get_scheme(
+                        layer=layer, layer_name=prefix.rsplit(".", 1)[-1]
+                    )
             except ValueError:
                 quant_scheme = None
             if quant_scheme is not None:
@@ -193,6 +198,8 @@ class CompressedTensorsConfig(QuantizationConfig):
             weight_quant = scheme_dict.get("weights") if scheme_dict else None
             if weight_quant is None:
                 return None  # unquantized embedding
+            if self._is_fp8_w8a16(weight_quant, None):
+                return CompressedTensorsEmbeddingW8A16Fp8(weight_quant)
             if not (
                 isinstance(weight_quant, QuantizationArgs)
                 and self._is_wNa16_group_channel(weight_quant, None)
