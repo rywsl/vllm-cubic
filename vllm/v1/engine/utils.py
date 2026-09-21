@@ -40,6 +40,32 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 STARTUP_POLL_PERIOD_MS = 10000
+ROCM_ENGINE_PROCESS_SHUTDOWN_TIMEOUT_S = 15.0
+
+
+def get_engine_process_shutdown_timeout(
+    request_timeout: float | None,
+    process_timeout: float | None,
+) -> float | None:
+    """Return the EngineCore process-manager shutdown timeout.
+
+    ``VllmConfig.shutdown_timeout`` controls how long in-flight requests may
+    drain. A value of zero therefore tells EngineCore to abort requests as soon
+    as it receives SIGTERM. The parent process manager still needs a separate
+    window in which the EngineCore can release device resources before it is
+    force-killed. ROCm teardown can take longer than the generic best-effort
+    window, and force-killing during teardown can leave VRAM resident.
+
+    ``process_timeout`` may be a remaining budget computed by an outer process
+    manager. Keep it unchanged unless both values are zero: a zero remaining
+    budget for a positive request timeout must not receive a fresh grace period
+    because EngineCore relies on that deadline to enforce request draining.
+    The process manager separately adds the distributed-worker teardown budget
+    to the result; that cleanup budget does not extend the request-drain deadline.
+    """
+    if request_timeout == 0 and process_timeout == 0 and current_platform.is_rocm():
+        return ROCM_ENGINE_PROCESS_SHUTDOWN_TIMEOUT_S
+    return process_timeout
 
 
 class CoreEngineState(Enum):
@@ -118,8 +144,7 @@ def _node_ip_from_resources(node_resources: dict) -> str | None:
 
 
 class CoreEngineProcManager:
-    """
-    Utility class to handle creation, readiness, and shutdown
+    """Utility class to handle creation, readiness, and shutdown
     of background processes used by the AsyncLLM and LLMEngine.
     """
 
@@ -136,6 +161,7 @@ class CoreEngineProcManager:
         client_handshake_address: str | None = None,
         tensor_queue: Queue | None = None,
     ):
+        self._request_shutdown_timeout = vllm_config.shutdown_timeout
         context = get_mp_context()
         common_kwargs = {
             "vllm_config": vllm_config,
@@ -217,16 +243,24 @@ class CoreEngineProcManager:
         """Shutdown engine core processes with configurable timeout."""
         self.manager_stopped.set()
         if self._finalizer.detach() is not None:
-            # ``shutdown_timeout`` controls request draining. Even when it is
-            # zero, EngineCore still needs time to tear down worker process
-            # groups before its TCPStore disappears.
-            if timeout is not None:
-                timeout += envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS + 4
-            shutdown(self.processes, timeout=timeout)
+            process_timeout = get_engine_process_shutdown_timeout(
+                self._request_shutdown_timeout, timeout
+            )
+            if process_timeout != timeout:
+                logger.info(
+                    "[shutdown] EngineCore process manager: using %ss ROCm "
+                    "cleanup grace after immediate request abort",
+                    process_timeout,
+                )
+            if process_timeout is not None:
+                process_timeout = max(
+                    process_timeout,
+                    (timeout or 0) + envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS + 4,
+                )
+            shutdown(self.processes, timeout=process_timeout)
 
     def monitor_engine_liveness(self) -> None:
         """Monitor engine core process liveness."""
-
         sentinel_to_proc = {proc.sentinel: proc for proc in self.processes}
         sentinels = set(sentinel_to_proc.keys())
 
@@ -287,8 +321,7 @@ def set_assigned_physical_gpu_ids_for_dp_rank(
     local_dp_rank: int,
     user_assigned_gpu_ids: list[int] | None = None,
 ) -> None:
-    """
-    Populate assigned_physical_gpu_ids on the config for the given DP rank.
+    """Populate assigned_physical_gpu_ids on the config for the given DP rank.
 
     user_assigned_gpu_ids is the full (un-sharded) --device-ids list, if the
     user provided one; this DP rank's shard is sliced from it. It is passed
@@ -316,8 +349,7 @@ def get_physical_gpu_ids_for_local_dp_rank(
     local_world_size: int | None = None,
     user_assigned_gpu_ids: list[int] | None = None,
 ) -> list[int]:
-    """
-    Returns list of physical GPU IDs for the specified
+    """Returns list of physical GPU IDs for the specified
     data parallel rank.
 
     For example, if world_size=2 and local_dp_rank=1, and there are 4 devices,
@@ -370,8 +402,7 @@ def _apply_dp_identity_suffix(dp_vllm_config, dp_rank: int) -> None:
 
 
 class CoreEngineActorManager:
-    """
-    Utility class to handle creation, readiness, and shutdown
+    """Utility class to handle creation, readiness, and shutdown
     of core engine Ray actors used by the AsyncLLM and LLMEngine.
 
     Different from CoreEngineProcManager, this class manages
@@ -523,10 +554,7 @@ class CoreEngineActorManager:
     def create_dp_placement_groups(
         vllm_config: VllmConfig,
     ) -> tuple[list["PlacementGroup"], list[int]]:
-        """
-        Create placement groups for data parallel.
-        """
-
+        """Create placement groups for data parallel."""
         import ray
         from ray._private.state import available_resources_per_node
 
@@ -740,9 +768,7 @@ class CoreEngineActorManager:
     def add_dp_placement_groups(
         old_vllm_config: VllmConfig, new_data_parallel_size: int
     ) -> tuple[list["PlacementGroup"], list[int]]:
-        """
-        Add placement groups for new data parallel size.
-        """
+        """Add placement groups for new data parallel size."""
         import ray
         from ray._private.state import (
             available_resources_per_node,
@@ -1079,7 +1105,6 @@ def launch_core_engines(
     addresses: EngineZmqAddresses,
 ) -> Iterator[CoreEngineLaunch]:
     """Launch engine and DP coordinator processes as needed."""
-
     parallel_config = vllm_config.parallel_config
     dp_size = parallel_config.data_parallel_size
     local_engine_count = parallel_config.data_parallel_size_local

@@ -154,7 +154,19 @@ def test_qwen3_5_cubic_expert_checkpoint_names_map_to_runtime_params(
     assert tuple(matches) == expected
 
 
-def test_cubic_fused_expert_metadata_keeps_native_layout():
+@pytest.mark.parametrize(
+    ("checkpoint_name", "parameter_name", "expert_split", "shard_id"),
+    [
+        ("gate_up_proj_packed", "w13_weight_packed", 0, "w1"),
+        ("gate_up_proj_packed", "w13_weight_packed", 1, "w3"),
+        ("gate_up_proj_scale", "w13_weight_scale", 0, "w1"),
+        ("gate_up_proj_scale", "w13_weight_scale", 1, "w3"),
+        ("down_proj_packed", "w2_weight_packed", 0, "w2"),
+    ],
+)
+def test_cubic_fused_expert_metadata_keeps_native_layout(
+    checkpoint_name, parameter_name, expert_split, shard_id
+):
     from vllm.model_executor.layers.fused_moe import RoutedExperts
 
     loaded = []
@@ -167,19 +179,26 @@ def test_cubic_fused_expert_metadata_keeps_native_layout():
     experts.layer_name = "experts"
     experts.moe_config.hidden_dim_unpadded = 6
     experts.cubic_fused_checkpoint_layout = True
+    # The model's dense checkpoint layout must not transpose Cubic byte packs.
+    experts.is_fused_checkpoint_transposed = True
     experts.get_expert_mapping.return_value = [
-        ("w13_weight_scale", "gate_up_proj_scale", 0, "w1")
+        (parameter_name, checkpoint_name, expert_split, shard_id)
     ]
-    experts.w13_weight_scale.weight_loader = weight_loader
+    getattr(experts, parameter_name).weight_loader = weight_loader
     checkpoint_tensor = torch.arange(2 * 8 * 3).reshape(2, 8, 3)
 
     list(
         RoutedExperts.load_weights(
             experts,
-            [("gate_up_proj_scale", checkpoint_tensor)],
+            [(checkpoint_name, checkpoint_tensor)],
         )
     )
 
     assert len(loaded) == 2
-    torch.testing.assert_close(loaded[0], checkpoint_tensor[0, :4])
-    torch.testing.assert_close(loaded[1], checkpoint_tensor[1, :4])
+    expected = (
+        checkpoint_tensor
+        if shard_id == "w2"
+        else checkpoint_tensor.chunk(2, dim=1)[expert_split]
+    )
+    torch.testing.assert_close(loaded[0], expected[0])
+    torch.testing.assert_close(loaded[1], expected[1])

@@ -70,7 +70,7 @@ _CUBIC_LINEAR_TILE_TACTICS: dict[
     tuple[int, int, int, int],
 ] = {}
 _CUBIC_COMPACT_LINEAR_TILE_TACTICS: dict[
-    tuple[int, bool, bool, int, int, int, int, int, int],
+    tuple[int, bool, int, int, int, int, int, int, int],
     tuple[int, int, int, int],
 ] = {}
 _CUBIC_LINEAR_STREAM_TACTICS: dict[
@@ -210,11 +210,13 @@ def _cubic_embedding_compact_kernel(
     a_code = tl.where(a_code >= 8, a_code - 16, a_code).to(tl.float32)
     b_code = tl.where(b_code >= 8, b_code - 16, b_code).to(tl.float32)
     scale = scale_code * tl.load(scale_global_ptr).to(tl.float32)
-    cubic_a = (1.0 + a_code * tl.load(a_global_ptr).to(tl.float32)).to(
-        tl.float16
-    ).to(tl.float32)
-    cubic_b = (b_code * tl.load(b_global_ptr).to(tl.float32)).to(tl.float16).to(
-        tl.float32
+    cubic_a = (
+        (1.0 + a_code * tl.load(a_global_ptr).to(tl.float32))
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    cubic_b = (
+        (b_code * tl.load(b_global_ptr).to(tl.float32)).to(tl.float16).to(tl.float32)
     )
 
     if num_bits == 1:
@@ -225,9 +227,7 @@ def _cubic_embedding_compact_kernel(
         signed = tl.where(signed == -sign_bit, 0, signed)
         magnitude_max: tl.constexpr = sign_bit - 1
         t = tl.abs(signed.to(tl.float32)) / magnitude_max
-        normalized = t * (
-            cubic_a + t * (cubic_b + t * (1.0 - cubic_a - cubic_b))
-        )
+        normalized = t * (cubic_a + t * (cubic_b + t * (1.0 - cubic_a - cubic_b)))
         normalized = tl.where(signed < 0, -normalized, normalized)
 
     output = tl.where(valid_id, normalized * scale, 0.0)
@@ -363,9 +363,7 @@ def _cubic_embedding_e5m9_curve2_kernel(
         signed = tl.where(signed == -sign_bit, 0, signed)
         magnitude_max: tl.constexpr = sign_bit - 1
         t = tl.abs(signed.to(tl.float32)) / magnitude_max
-        normalized = t * (
-            cubic_a + t * (cubic_b + t * (1.0 - cubic_a - cubic_b))
-        )
+        normalized = t * (cubic_a + t * (cubic_b + t * (1.0 - cubic_a - cubic_b)))
         normalized = tl.where(signed < 0, -normalized, normalized)
 
     output = tl.where(valid_id, normalized * scale, 0.0)
@@ -919,13 +917,10 @@ def _assert_cubic_reduction_equivalent(
     difference = (output.float() - reference.float()).abs()
     reference_rms = reference.float().square().mean().sqrt().clamp_min(1e-12)
     normalized_rms = difference.square().mean().sqrt() / reference_rms
-    elementwise_equivalent = (
-        ((output >= lower) & (output <= upper)) | (difference <= 1e-4)
+    elementwise_equivalent = ((output >= lower) & (output <= upper)) | (
+        difference <= 1e-4
     )
-    if (
-        not bool(elementwise_equivalent.all())
-        or float(normalized_rms) > 5e-4
-    ):
+    if not bool(elementwise_equivalent.all()) or float(normalized_rms) > 5e-4:
         torch.testing.assert_close(output, reference, rtol=0, atol=0)
 
 
@@ -2147,8 +2142,7 @@ def _cubic_linear_gemv_kernel(
             bytes_per_period: tl.constexpr = NUM_BITS if NUM_BITS == 5 else 3
             packed_k = tl.arange(0, BLOCK_K // values_per_period)
             packed_byte = (
-                k_block * (BLOCK_K * NUM_BITS // 8)
-                + packed_k * bytes_per_period
+                k_block * (BLOCK_K * NUM_BITS // 8) + packed_k * bytes_per_period
             )
             packed_ptrs = (
                 weight_ptr
@@ -2225,9 +2219,7 @@ def _cubic_linear_gemv_kernel(
                     mask=weight_mask & (byte_indices + 1 < PACKED_K),
                     other=0,
                 ).to(tl.int32)
-            raw = ((low >> shifts) | (high << (8 - shifts))) & (
-                (1 << NUM_BITS) - 1
-            )
+            raw = ((low >> shifts) | (high << (8 - shifts))) & ((1 << NUM_BITS) - 1)
         group = (k_block * BLOCK_K) // GROUP_SIZE
         metadata_offsets = (offs_n // GROUP_OUT) * stride_sn + group * stride_sg
         metadata_mask = n_mask & (group < NUM_GROUPS)
@@ -2301,19 +2293,19 @@ def _cubic_load_compact_metadata(
         tl.int32
     )
     if E5M9_CURVE2_METADATA:
-        metadata = tl.load(
-            scale_code_ptr + metadata_offsets, mask=mask, other=0
-        ).to(tl.uint16)
+        metadata = tl.load(scale_code_ptr + metadata_offsets, mask=mask, other=0).to(
+            tl.uint16
+        )
         curve_id = (metadata >> 14).to(tl.int32)
         scale_bits = ((metadata & 0x3FFF) << 1).to(tl.uint16)
         scale = scale_bits.to(tl.float16, bitcast=True).to(tl.float32)
         curve_offset = global_index * 4 + curve_id
-        cubic_a = tl.load(
-            packed_ab_ptr + curve_offset, mask=mask, other=1.0
-        ).to(tl.float32)
-        cubic_b = tl.load(
-            scale_global_ptr + curve_offset, mask=mask, other=0.0
-        ).to(tl.float32)
+        cubic_a = tl.load(packed_ab_ptr + curve_offset, mask=mask, other=1.0).to(
+            tl.float32
+        )
+        cubic_b = tl.load(scale_global_ptr + curve_offset, mask=mask, other=0.0).to(
+            tl.float32
+        )
         return scale, cubic_a, cubic_b
     scale_global = tl.load(scale_global_ptr + global_index, mask=mask, other=0.0).to(
         tl.float32
@@ -2356,12 +2348,12 @@ def _cubic_load_moe_metadata(
         scale = tl.load(primary_ptr + metadata_offsets, mask=mask, other=0.0).to(
             tl.float32
         )
-        cubic_a = tl.load(
-            secondary_ptr + metadata_offsets, mask=mask, other=1.0
-        ).to(tl.float32)
-        cubic_b = tl.load(
-            tertiary_ptr + metadata_offsets, mask=mask, other=0.0
-        ).to(tl.float32)
+        cubic_a = tl.load(secondary_ptr + metadata_offsets, mask=mask, other=1.0).to(
+            tl.float32
+        )
+        cubic_b = tl.load(tertiary_ptr + metadata_offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
         # Keep the loader's return rank determined by the output tile rather
         # than by constant-folding of a shared metadata offset.  For legacy
         # ``(Gout, Gin)`` layouts, every output in a tile may share one scalar
@@ -2387,23 +2379,19 @@ def _cubic_load_moe_metadata(
         scale_bits = ((metadata & 0x3FFF) << 1).to(tl.uint16)
         scale = scale_bits.to(tl.float16, bitcast=True).to(tl.float32)
         curve_offset = table_offset * 4 + curve_id
-        cubic_a = tl.load(
-            secondary_ptr + curve_offset, mask=mask, other=1.0
-        ).to(tl.float32)
-        cubic_b = tl.load(
-            tertiary_ptr + curve_offset, mask=mask, other=0.0
-        ).to(tl.float32)
+        cubic_a = tl.load(secondary_ptr + curve_offset, mask=mask, other=1.0).to(
+            tl.float32
+        )
+        cubic_b = tl.load(tertiary_ptr + curve_offset, mask=mask, other=0.0).to(
+            tl.float32
+        )
         return scale, cubic_a, cubic_b
 
-    scale_global = tl.load(
-        scale_global_ptr + table_offset, mask=mask, other=0.0
-    ).to(tl.float32)
-    a_global = tl.load(a_global_ptr + table_offset, mask=mask, other=0.0).to(
+    scale_global = tl.load(scale_global_ptr + table_offset, mask=mask, other=0.0).to(
         tl.float32
     )
-    b_global = tl.load(b_global_ptr + table_offset, mask=mask, other=0.0).to(
-        tl.float32
-    )
+    a_global = tl.load(a_global_ptr + table_offset, mask=mask, other=0.0).to(tl.float32)
+    b_global = tl.load(b_global_ptr + table_offset, mask=mask, other=0.0).to(tl.float32)
     scale_code = tl.load(primary_ptr + metadata_offsets, mask=mask, other=0).to(
         tl.float32
     )
@@ -3154,11 +3142,7 @@ def cubic_linear_compact(
             fallback=fallback,
         )
     block_m, block_n, num_warps, num_stages = tile
-    use_gemv = (
-        x_2d.shape[0] <= 8
-        and block_m == 1
-        and not envs.VLLM_BATCH_INVARIANT
-    )
+    use_gemv = x_2d.shape[0] <= 8 and block_m == 1 and not envs.VLLM_BATCH_INVARIANT
     if use_gemv:
         grid = (triton.cdiv(packed.shape[0], block_n), x_2d.shape[0])
         if num_bits == 4 and group_size == 32 and group_out == 1:
@@ -3296,15 +3280,11 @@ def _cubic_w5_curve2_pair_lut_gemv_kernel(
         segment_k = segment * SEGMENT_SIZE
         byte_offset = segment_k * 5 // 8 + periods * 5
         packed_ptrs = (
-            packed_ptr
-            + offs_n[:, None] * stride_wn
-            + byte_offset[None, :] * stride_wp
+            packed_ptr + offs_n[:, None] * stride_wn + byte_offset[None, :] * stride_wp
         )
         packed_mask = n_mask[:, None] & (byte_offset[None, :] < packed_k)
         byte0 = tl.load(packed_ptrs, mask=packed_mask, other=0).to(tl.int32)
-        byte1 = tl.load(packed_ptrs + stride_wp, mask=packed_mask, other=0).to(
-            tl.int32
-        )
+        byte1 = tl.load(packed_ptrs + stride_wp, mask=packed_mask, other=0).to(tl.int32)
         byte2 = tl.load(packed_ptrs + 2 * stride_wp, mask=packed_mask, other=0).to(
             tl.int32
         )
@@ -3350,16 +3330,12 @@ def _cubic_w5_curve2_pair_lut_gemv_kernel(
 
         word_offset = segment * words_per_segment + periods * 2
         activation0 = tl.load(
-            activation_words_ptr
-            + row * stride_awm
-            + word_offset * stride_awk,
+            activation_words_ptr + row * stride_awm + word_offset * stride_awk,
             mask=row < M,
             other=0,
         ).to(tl.int32)
         activation1 = tl.load(
-            activation_words_ptr
-            + row * stride_awm
-            + (word_offset + 1) * stride_awk,
+            activation_words_ptr + row * stride_awm + (word_offset + 1) * stride_awk,
             mask=row < M,
             other=0,
         ).to(tl.int32)
@@ -3368,17 +3344,12 @@ def _cubic_w5_curve2_pair_lut_gemv_kernel(
         partial = tl.sum(dots, axis=1)
         activation_group = segment_k // ACTIVATION_GROUP_SIZE
         activation_scale = tl.load(
-            activation_scale_ptr
-            + row * stride_asm
-            + activation_group * stride_asg,
+            activation_scale_ptr + row * stride_asm + activation_group * stride_asg,
             mask=row < M,
             other=0.0,
         ).to(tl.float32)
         accumulator += (
-            partial.to(tl.float32)
-            * activation_scale
-            * weight_scale
-            * (1.0 / 127.0)
+            partial.to(tl.float32) * activation_scale * weight_scale * (1.0 / 127.0)
         )
     tl.store(
         output_ptr + row * stride_om + offs_n * stride_on,
@@ -3432,15 +3403,11 @@ def _cubic_w5_compact_dp4a_gemv_kernel(
         segment_k = segment * SEGMENT_SIZE
         byte_offset = segment_k * 5 // 8 + periods * 5
         packed_ptrs = (
-            packed_ptr
-            + offs_n[:, None] * stride_wn
-            + byte_offset[None, :] * stride_wp
+            packed_ptr + offs_n[:, None] * stride_wn + byte_offset[None, :] * stride_wp
         )
         packed_mask = n_mask[:, None] & (byte_offset[None, :] < packed_k)
         byte0 = tl.load(packed_ptrs, mask=packed_mask, other=0).to(tl.int32)
-        byte1 = tl.load(packed_ptrs + stride_wp, mask=packed_mask, other=0).to(
-            tl.int32
-        )
+        byte1 = tl.load(packed_ptrs + stride_wp, mask=packed_mask, other=0).to(tl.int32)
         byte2 = tl.load(packed_ptrs + 2 * stride_wp, mask=packed_mask, other=0).to(
             tl.int32
         )
@@ -3478,49 +3445,41 @@ def _cubic_w5_compact_dp4a_gemv_kernel(
         )
         cubic_a = cubic_a[:, None]
         cubic_b = cubic_b[:, None]
-        carrier0 = _cubic_dynamic_a8_carrier(raw0, cubic_a, cubic_b, 5).to(
-            tl.int32
-        ) & 0xFF
-        carrier1 = _cubic_dynamic_a8_carrier(raw1, cubic_a, cubic_b, 5).to(
-            tl.int32
-        ) & 0xFF
-        carrier2 = _cubic_dynamic_a8_carrier(raw2, cubic_a, cubic_b, 5).to(
-            tl.int32
-        ) & 0xFF
-        carrier3 = _cubic_dynamic_a8_carrier(raw3, cubic_a, cubic_b, 5).to(
-            tl.int32
-        ) & 0xFF
-        carrier4 = _cubic_dynamic_a8_carrier(raw4, cubic_a, cubic_b, 5).to(
-            tl.int32
-        ) & 0xFF
-        carrier5 = _cubic_dynamic_a8_carrier(raw5, cubic_a, cubic_b, 5).to(
-            tl.int32
-        ) & 0xFF
-        carrier6 = _cubic_dynamic_a8_carrier(raw6, cubic_a, cubic_b, 5).to(
-            tl.int32
-        ) & 0xFF
-        carrier7 = _cubic_dynamic_a8_carrier(raw7, cubic_a, cubic_b, 5).to(
-            tl.int32
-        ) & 0xFF
-        carrier_word0 = (
-            carrier0 | (carrier1 << 8) | (carrier2 << 16) | (carrier3 << 24)
+        carrier0 = (
+            _cubic_dynamic_a8_carrier(raw0, cubic_a, cubic_b, 5).to(tl.int32) & 0xFF
         )
-        carrier_word1 = (
-            carrier4 | (carrier5 << 8) | (carrier6 << 16) | (carrier7 << 24)
+        carrier1 = (
+            _cubic_dynamic_a8_carrier(raw1, cubic_a, cubic_b, 5).to(tl.int32) & 0xFF
         )
+        carrier2 = (
+            _cubic_dynamic_a8_carrier(raw2, cubic_a, cubic_b, 5).to(tl.int32) & 0xFF
+        )
+        carrier3 = (
+            _cubic_dynamic_a8_carrier(raw3, cubic_a, cubic_b, 5).to(tl.int32) & 0xFF
+        )
+        carrier4 = (
+            _cubic_dynamic_a8_carrier(raw4, cubic_a, cubic_b, 5).to(tl.int32) & 0xFF
+        )
+        carrier5 = (
+            _cubic_dynamic_a8_carrier(raw5, cubic_a, cubic_b, 5).to(tl.int32) & 0xFF
+        )
+        carrier6 = (
+            _cubic_dynamic_a8_carrier(raw6, cubic_a, cubic_b, 5).to(tl.int32) & 0xFF
+        )
+        carrier7 = (
+            _cubic_dynamic_a8_carrier(raw7, cubic_a, cubic_b, 5).to(tl.int32) & 0xFF
+        )
+        carrier_word0 = carrier0 | (carrier1 << 8) | (carrier2 << 16) | (carrier3 << 24)
+        carrier_word1 = carrier4 | (carrier5 << 8) | (carrier6 << 16) | (carrier7 << 24)
 
         word_offset = segment * words_per_segment + periods * 2
         activation0 = tl.load(
-            activation_words_ptr
-            + row * stride_awm
-            + word_offset * stride_awk,
+            activation_words_ptr + row * stride_awm + word_offset * stride_awk,
             mask=row < M,
             other=0,
         ).to(tl.int32)
         activation1 = tl.load(
-            activation_words_ptr
-            + row * stride_awm
-            + (word_offset + 1) * stride_awk,
+            activation_words_ptr + row * stride_awm + (word_offset + 1) * stride_awk,
             mask=row < M,
             other=0,
         ).to(tl.int32)
@@ -3529,17 +3488,12 @@ def _cubic_w5_compact_dp4a_gemv_kernel(
         partial = tl.sum(dots, axis=1)
         activation_group = segment_k // ACTIVATION_GROUP_SIZE
         activation_scale = tl.load(
-            activation_scale_ptr
-            + row * stride_asm
-            + activation_group * stride_asg,
+            activation_scale_ptr + row * stride_asm + activation_group * stride_asg,
             mask=row < M,
             other=0.0,
         ).to(tl.float32)
         accumulator += (
-            partial.to(tl.float32)
-            * activation_scale
-            * weight_scale
-            * (1.0 / 127.0)
+            partial.to(tl.float32) * activation_scale * weight_scale * (1.0 / 127.0)
         )
     tl.store(
         output_ptr + row * stride_om + offs_n * stride_on,
@@ -3576,9 +3530,7 @@ def cubic_linear_dynamic_a8_w5_curve2_pair_lut(
         raise ValueError("W5 pair-LUT requires aligned groups and an INT16 LUT.")
     activation = _quantize_cubic_groupwise_a8(x_2d, activation_group_size)
     activation_words = activation.values.view(torch.int32)
-    output = torch.empty(
-        x_2d.shape[0], packed.shape[0], device=x.device, dtype=x.dtype
-    )
+    output = torch.empty(x_2d.shape[0], packed.shape[0], device=x.device, dtype=x.dtype)
     block_n = 16
     grid = (triton.cdiv(packed.shape[0], block_n), x_2d.shape[0])
     _launch_or_compile_triton(
@@ -3645,9 +3597,7 @@ def cubic_linear_dynamic_a8_w5_compact_dp4a(
         raise ValueError("W5 compact DP4A requires INT8/INT4 compact metadata.")
     activation = _quantize_cubic_groupwise_a8(x_2d, activation_group_size)
     activation_words = activation.values.view(torch.int32)
-    output = torch.empty(
-        x_2d.shape[0], packed.shape[0], device=x.device, dtype=x.dtype
-    )
+    output = torch.empty(x_2d.shape[0], packed.shape[0], device=x.device, dtype=x.dtype)
     block_n = 16
     grid = (triton.cdiv(packed.shape[0], block_n), x_2d.shape[0])
     _launch_or_compile_triton(
@@ -3751,8 +3701,7 @@ def _cubic_linear_dynamic_a8_compact_gemv_kernel(
             bytes_per_period: tl.constexpr = 5 if NUM_BITS == 5 else 3
             packed_k = tl.arange(0, BLOCK_K // values_per_period)
             packed_byte = (
-                k_block * (BLOCK_K * NUM_BITS // 8)
-                + packed_k * bytes_per_period
+                k_block * (BLOCK_K * NUM_BITS // 8) + packed_k * bytes_per_period
             )
             packed_ptrs = (
                 weight_ptr
@@ -3829,9 +3778,7 @@ def _cubic_linear_dynamic_a8_compact_gemv_kernel(
                     mask=weight_mask & (byte_indices + 1 < PACKED_K),
                     other=0,
                 ).to(tl.int32)
-            raw = ((low >> shifts) | (high << (8 - shifts))) & (
-                (1 << NUM_BITS) - 1
-            )
+            raw = ((low >> shifts) | (high << (8 - shifts))) & ((1 << NUM_BITS) - 1)
         group = (k_block * BLOCK_K) // GROUP_SIZE
         output_groups = offs_n // GROUP_OUT
         metadata_offsets = output_groups * stride_sn + group * stride_sg
@@ -4012,9 +3959,7 @@ def _cubic_linear_dynamic_a8_compact_kernel(
                 * carrier[None, :, :].to(tl.float32),
                 axis=1,
             )
-            accumulator += (
-                partial * activation_scale * weight_scale * (1.0 / 127.0)
-            )
+            accumulator += partial * activation_scale * weight_scale * (1.0 / 127.0)
         else:
             partial = tl.dot(activation, carrier, out_dtype=tl.int32)
             accumulator += (
@@ -4141,9 +4086,7 @@ def cubic_linear_dynamic_a8_compact(
         else:
             block_m, block_n, num_warps, num_stages = _cubic_compact_linear_tile(
                 dynamic_a8=True,
-                expanded_metadata=(
-                    2 if _e5m9_curve2_metadata else _expanded_metadata
-                ),
+                expanded_metadata=(2 if _e5m9_curve2_metadata else _expanded_metadata),
                 num_bits=num_bits,
                 n=packed.shape[0],
                 k=input_size,
@@ -4339,9 +4282,7 @@ def _cubic_linear_dynamic_a8_kernel(
                 * carrier[None, :, :].to(tl.float32),
                 axis=1,
             )
-            accumulator += (
-                partial * activation_scale * weight_scale * (1.0 / 127.0)
-            )
+            accumulator += partial * activation_scale * weight_scale * (1.0 / 127.0)
         else:
             partial = tl.dot(activation, carrier, out_dtype=tl.int32)
             accumulator += (
@@ -4444,9 +4385,7 @@ def _materialize_cubic_compact_a8_carrier_kernel(
     bit_positions = offs_k[None, :] * NUM_BITS
     byte_indices = bit_positions // 8
     shifts = bit_positions % 8
-    packed_ptrs = (
-        weight_ptr + offs_n[:, None] * stride_wn + byte_indices * stride_wp
-    )
+    packed_ptrs = weight_ptr + offs_n[:, None] * stride_wn + byte_indices * stride_wp
     weight_mask = n_mask[:, None] & k_mask[None, :]
     low = tl.load(packed_ptrs, mask=weight_mask, other=0).to(tl.int32)
     if 8 % NUM_BITS == 0:
@@ -4999,9 +4938,7 @@ def _cubic_linear_precomputed_a8_dp4a_gemv_kernel(
     offs_word = tl.arange(0, words_per_segment)
     accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
     num_segments: tl.constexpr = tl.cdiv(K, SEGMENT_SIZE)
-    for segment_base in tl.range(
-        0, tl.cdiv(num_segments, SEGMENTS_PER_ITERATION)
-    ):
+    for segment_base in tl.range(0, tl.cdiv(num_segments, SEGMENTS_PER_ITERATION)):
         for inner in tl.static_range(0, SEGMENTS_PER_ITERATION):
             segment = segment_base * SEGMENTS_PER_ITERATION + inner
             segment_mask = segment < num_segments
@@ -5031,9 +4968,7 @@ def _cubic_linear_precomputed_a8_dp4a_gemv_kernel(
             activation_group = logical_k // ACTIVATION_GROUP_SIZE
             weight_group = logical_k // GROUP_SIZE
             activation_scale = tl.load(
-                activation_scale_ptr
-                + row * stride_asm
-                + activation_group * stride_asg,
+                activation_scale_ptr + row * stride_asm + activation_group * stride_asg,
                 mask=(row < M) & segment_mask,
                 other=0.0,
             ).to(tl.float32)
@@ -5041,16 +4976,11 @@ def _cubic_linear_precomputed_a8_dp4a_gemv_kernel(
                 weight_scale_ptr
                 + (offs_n // GROUP_OUT) * stride_sn
                 + weight_group * stride_sg,
-                mask=n_mask
-                & segment_mask
-                & (weight_group < NUM_GROUPS),
+                mask=n_mask & segment_mask & (weight_group < NUM_GROUPS),
                 other=0.0,
             ).to(tl.float32)
             accumulator += (
-                partial.to(tl.float32)
-                * activation_scale
-                * weight_scale
-                * (1.0 / 127.0)
+                partial.to(tl.float32) * activation_scale * weight_scale * (1.0 / 127.0)
             )
 
     tl.store(
@@ -5095,9 +5025,7 @@ def _cubic_linear_precomputed_a8_dp4a_kmajor_gemv_kernel(
     offs_word = tl.arange(0, words_per_segment)
     accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
     num_segments: tl.constexpr = tl.cdiv(K, SEGMENT_SIZE)
-    for segment_base in tl.range(
-        0, tl.cdiv(num_segments, SEGMENTS_PER_ITERATION)
-    ):
+    for segment_base in tl.range(0, tl.cdiv(num_segments, SEGMENTS_PER_ITERATION)):
         for inner in tl.static_range(0, SEGMENTS_PER_ITERATION):
             segment = segment_base * SEGMENTS_PER_ITERATION + inner
             segment_mask = segment < num_segments
@@ -5128,9 +5056,7 @@ def _cubic_linear_precomputed_a8_dp4a_kmajor_gemv_kernel(
             activation_group = segment_k // ACTIVATION_GROUP_SIZE
             weight_group = segment_k // GROUP_SIZE
             activation_scale = tl.load(
-                activation_scale_ptr
-                + row * stride_asm
-                + activation_group * stride_asg,
+                activation_scale_ptr + row * stride_asm + activation_group * stride_asg,
                 mask=(row < M) & segment_mask,
                 other=0.0,
             ).to(tl.float32)
@@ -5142,10 +5068,7 @@ def _cubic_linear_precomputed_a8_dp4a_kmajor_gemv_kernel(
                 other=0.0,
             ).to(tl.float32)
             accumulator += (
-                partial.to(tl.float32)
-                * activation_scale
-                * weight_scale
-                * (1.0 / 127.0)
+                partial.to(tl.float32) * activation_scale * weight_scale * (1.0 / 127.0)
             )
     tl.store(
         output_ptr + row * stride_om + offs_n * stride_on,
@@ -6970,25 +6893,19 @@ def _cubic_moe_compact_a8_dp4a_gemv_kernel(
                         & (global_k[None, :] < K)
                         & valid_route
                     )
-                    low = tl.load(packed_ptrs, mask=weight_mask, other=0).to(
-                        tl.int32
-                    )
+                    low = tl.load(packed_ptrs, mask=weight_mask, other=0).to(tl.int32)
                     if 8 % NUM_BITS == 0:
                         high = 0
                     else:
                         high = tl.load(
                             packed_ptrs + stride_wp,
-                            mask=weight_mask
-                            & (byte_indices[None, :] + 1 < PACKED_K),
+                            mask=weight_mask & (byte_indices[None, :] + 1 < PACKED_K),
                             other=0,
                         ).to(tl.int32)
                     raw = (
-                        (low >> shifts[None, :])
-                        | (high << (8 - shifts[None, :]))
+                        (low >> shifts[None, :]) | (high << (8 - shifts[None, :]))
                     ) & ((1 << NUM_BITS) - 1)
-                    carrier = _cubic_dynamic_a8_carrier(
-                        raw, cubic_a, cubic_b, NUM_BITS
-                    )
+                    carrier = _cubic_dynamic_a8_carrier(raw, cubic_a, cubic_b, NUM_BITS)
                     carrier_word |= (carrier.to(tl.int32) & 0xFF) << (lane * 8)
                 activation_word = tl.load(
                     input_words_ptr
@@ -10225,9 +10142,7 @@ def _cubic_moe_gemv_kernel(
                             + (offs_n[:, None] // GROUP_OUT) * stride_sn
                             + global_k[None, :] * stride_sg
                         )
-                        metadata_mask = (
-                            n_mask[:, None] & k_mask[None, :] & valid_route
-                        )
+                        metadata_mask = n_mask[:, None] & k_mask[None, :] & valid_route
                 else:
                     group = (k_block * BLOCK_K) // GROUP_SIZE
                     metadata_ptrs = (
@@ -14872,9 +14787,8 @@ def calibrate_cubic_a8_moe_grouping(
     """Measure route grouping for a complete route-kernel MoE layer."""
     device = torch.accelerator.current_device_index()
     metadata_format = (
-        (w13_compact_metadata.format if w13_compact_metadata is not None else 0) * 4
-        + (w2_compact_metadata.format if w2_compact_metadata is not None else 0)
-    )
+        w13_compact_metadata.format if w13_compact_metadata is not None else 0
+    ) * 4 + (w2_compact_metadata.format if w2_compact_metadata is not None else 0)
     key = (
         device,
         num_bits,
@@ -15239,8 +15153,7 @@ def calibrate_cubic_moe_execution(
         for score, use_gemv, block_m, block_k in scores
     )
     init_logger(__name__).info(
-        "Cubic %s execution: W%d H=%d I=%d G=%dx%d M=%d mode=%s %s "
-        "(%.4f ms)",
+        "Cubic %s execution: W%d H=%d I=%d G=%dx%d M=%d mode=%s %s (%.4f ms)",
         "A8" if dynamic_a8 else "A16",
         num_bits,
         hidden_size,
@@ -15799,8 +15712,7 @@ def cubic_fused_moe_dynamic_a8(
                 and w2_b.dtype == torch.float16
             ),
             compact_metadata=(
-                w13_compact_metadata is not None
-                and w2_compact_metadata is not None
+                w13_compact_metadata is not None and w2_compact_metadata is not None
             ),
             metadata_format=(
                 (w13_compact_metadata.format if w13_compact_metadata else 0) * 4

@@ -121,9 +121,7 @@ class CompressedTensorsEmbeddingW8A16Fp8(QuantizeMethodBase):
             layer.weight_scale,
             output,
             hidden,
-            SCALE_STRATEGY=int(
-                self.strategy == QuantizationStrategy.CHANNEL.value
-            ),
+            SCALE_STRATEGY=int(self.strategy == QuantizationStrategy.CHANNEL.value),
             BLOCK=block,
         )
         return output.reshape(*input_.shape, hidden)

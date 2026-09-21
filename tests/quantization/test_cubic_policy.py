@@ -41,9 +41,7 @@ def test_cubic_token_buckets_are_finite_and_ordered() -> None:
     ("num_tokens", "expected"),
     [(1, 1), (2, 2), (4, 4), (8, 8), (9, 16), (17, 32)],
 )
-def test_cubic_linear_uses_real_small_m_bucket(
-    num_tokens: int, expected: int
-) -> None:
+def test_cubic_linear_uses_real_small_m_bucket(num_tokens: int, expected: int) -> None:
     assert cubic_linear_token_bucket(num_tokens) == expected
 
 

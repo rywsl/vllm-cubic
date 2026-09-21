@@ -133,6 +133,7 @@ def test_engine_process_shutdown_preserves_cleanup_grace(
     manager._finalizer = Mock()
     manager._finalizer.detach.return_value = object()
 
+    manager._request_shutdown_timeout = request_timeout
     manager.shutdown(timeout=request_timeout)
 
     assert manager.manager_stopped.is_set()

@@ -36,8 +36,7 @@ def causal_conv1d_ref(
     final_states_out: torch.Tensor | None = None,
     activation: str | None = "silu",
 ):
-    """
-    x: (batch, dim, seqlen)
+    """x: (batch, dim, seqlen)
     weight: (dim, width)
     bias: (dim,)
     initial_states: (batch, dim, width - 1)
@@ -72,8 +71,7 @@ def causal_conv1d_ref(
 def causal_conv1d_update_ref(
     x, conv_state, weight, bias=None, activation=None, cache_seqlens=None
 ):
-    """
-    x: (batch, dim) or (batch, dim, seqlen)
+    """x: (batch, dim) or (batch, dim, seqlen)
     conv_state: (batch, dim, state_len), where state_len >= width - 1
     weight: (dim, width)
     bias: (dim,)
@@ -136,8 +134,7 @@ def causal_conv1d_opcheck_fn(
     activation: str | None = "silu",
     null_block_id: int = NULL_BLOCK_ID,
 ):
-    """
-    x: (batch, dim, seqlen)
+    """x: (batch, dim, seqlen)
     weight: (dim, width)
     bias: (dim,)
     seq_idx: (batch, seqlen)
@@ -213,9 +210,7 @@ def test_spec_varlen_update_matches_per_sequence_exactly(batch, itype):
     )
     state_indices = torch.arange(1, batch + 1, device=device, dtype=torch.int32)
     num_accepted_tokens = torch.ones(batch, device=device, dtype=torch.int32)
-    initial = torch.randn(
-        batch + 1, dim, state_len, device=device, dtype=itype
-    )
+    initial = torch.randn(batch + 1, dim, state_len, device=device, dtype=itype)
     packed_state = initial.clone()
     packed_output = causal_conv1d_update(
         x.clone(),
@@ -243,9 +238,7 @@ def test_spec_varlen_update_matches_per_sequence_exactly(batch, itype):
             activation="silu",
             conv_state_indices=torch.ones(1, device=device, dtype=torch.int32),
             num_accepted_tokens=torch.ones(1, device=device, dtype=torch.int32),
-            query_start_loc=torch.tensor(
-                [0, tokens], device=device, dtype=torch.int32
-            ),
+            query_start_loc=torch.tensor([0, tokens], device=device, dtype=torch.int32),
             max_query_len=tokens,
         )
         reference_outputs.append(output)

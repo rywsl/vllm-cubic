@@ -116,9 +116,7 @@ def _moe_metadata_signature(
     )
 
 
-def _moe_runtime_group_size(
-    layer: torch.nn.Module, method: CubicMoEMethod
-) -> int:
+def _moe_runtime_group_size(layer: torch.nn.Module, method: CubicMoEMethod) -> int:
     return int(getattr(layer, "cubic_runtime_group_size", method.scheme.group_size))
 
 
@@ -183,10 +181,7 @@ def _cubic_tactic_cache_key(
 
     source_paths = (
         Path(__file__),
-        Path(__file__).resolve().parents[1]
-        / "layers"
-        / "quantization"
-        / "cubic.py",
+        Path(__file__).resolve().parents[1] / "layers" / "quantization" / "cubic.py",
         Path(__file__).resolve().parents[1]
         / "layers"
         / "quantization"
@@ -753,11 +748,7 @@ def _validate_cubic_resident_output(
         .item()
     )
     min_cosine = cosine.min().item()
-    if (
-        nrmse > max_nrmse
-        or min_cosine < 0.9999
-        or norm_ratio_error > 0.01
-    ):
+    if nrmse > max_nrmse or min_cosine < 0.9999 or norm_ratio_error > 0.01:
         raise AssertionError(
             "Cubic resident candidate exceeds accumulation-order bounds: "
             f"nrmse={nrmse:.6g}, min_cosine={min_cosine:.8g}, "
@@ -791,9 +782,7 @@ def _validate_cubic_linear_column_mapping(
 ) -> None:
     """Reject layout/group errors using reduction-free one-hot probes."""
     indices = indices.to(device=device)
-    probes = torch.zeros(
-        (indices.numel(), input_size), device=device, dtype=dtype
-    )
+    probes = torch.zeros((indices.numel(), input_size), device=device, dtype=dtype)
     probes[torch.arange(indices.numel(), device=device), indices] = 1
     actual = operation(probes)
     expected = expected_columns.to(device=device, dtype=actual.dtype)
@@ -1013,12 +1002,8 @@ def _materialize_cubic_linear_residency(
     )
     remaining = budget
     hybrid_online_buckets: dict[tuple[Any, ...], tuple[int, ...]] = {}
-    hybrid_expanded_metadata_buckets: dict[
-        tuple[Any, ...], tuple[int, ...]
-    ] = {}
-    hybrid_expanded_metadata_dense_buckets: dict[
-        tuple[Any, ...], tuple[int, ...]
-    ] = {}
+    hybrid_expanded_metadata_buckets: dict[tuple[Any, ...], tuple[int, ...]] = {}
+    hybrid_expanded_metadata_dense_buckets: dict[tuple[Any, ...], tuple[int, ...]] = {}
     exact_marlin_buckets: dict[tuple[Any, ...], tuple[int, ...]] = {}
     plans: list[
         tuple[
@@ -1163,8 +1148,7 @@ def _materialize_cubic_linear_residency(
                 {
                     bucket
                     for bucket in required_buckets
-                    if metadata_measurements[bucket][1] * 1.03
-                    < measurements[bucket][1]
+                    if metadata_measurements[bucket][1] * 1.03 < measurements[bucket][1]
                 }
                 if metadata_measurements
                 else set()
@@ -1518,8 +1502,7 @@ def _warmup_cubic_linear_families(
                 layer, method.scheme
             )
             curve2_metadata = (
-                method.scheme.metadata_format
-                == CUBIC_E5M9_CURVE2_METADATA_FORMAT
+                method.scheme.metadata_format == CUBIC_E5M9_CURVE2_METADATA_FORMAT
             )
             if curve2_metadata:
                 compact_scale = layer.weight_metadata
@@ -1559,8 +1542,8 @@ def _warmup_cubic_linear_families(
                 device = layer.weight_packed.device
                 reclaimable_cache = max(
                     0,
-                    torch.cuda.memory_reserved(device)
-                    - torch.cuda.memory_allocated(device),
+                    torch.accelerator.memory_reserved(device)
+                    - torch.accelerator.memory_allocated(device),
                 )
                 free_memory = min(
                     total_memory,
@@ -1659,8 +1642,7 @@ def _warmup_cubic_linear_families(
                     residency_marlin_extra_bytes = max(0, n * k - packed_bytes)
                     residency_marlin_extra_bytes += max(
                         0,
-                        scale.numel() * scale.element_size()
-                        - compact_metadata_bytes,
+                        scale.numel() * scale.element_size() - compact_metadata_bytes,
                     )
                     if residency_marlin is not None:
                         residency_marlin_extra_bytes += (
@@ -1709,9 +1691,7 @@ def _warmup_cubic_linear_families(
                         input_size=k,
                         dynamic_a8=method.dynamic_a8,
                         e5m9_curve2_metadata=curve2_metadata,
-                        curve_pair_lut=getattr(
-                            layer, "weight_curve_pair_lut", None
-                        ),
+                        curve_pair_lut=getattr(layer, "weight_curve_pair_lut", None),
                     )
                     expanded_metadata_ms = calibrate_cubic_compact_linear_execution(
                         x,
@@ -1838,6 +1818,7 @@ def _warmup_cubic_linear_families(
                                 dtype=layer.params_dtype,
                             )
                         else:
+                            assert residency_expanded is not None
                             canonical_columns = residency_expanded[
                                 :, probe_indices.to(residency_expanded.device)
                             ].T
@@ -1891,9 +1872,7 @@ def _warmup_cubic_linear_families(
                             device=layer.weight_packed.device,
                         )
                         try:
-                            _validate_cubic_resident_output(
-                                online(), canonical()
-                            )
+                            _validate_cubic_resident_output(online(), canonical())
                         except AssertionError as error:
                             logger.warning(
                                 "Rejecting Cubic Linear online implementation "
@@ -2353,6 +2332,7 @@ def _warmup_cubic_linear_families(
                             dtype=layer.params_dtype,
                         )
                     else:
+                        assert residency_expanded is not None
                         canonical_columns = residency_expanded[
                             :, probe_indices.to(residency_expanded.device)
                         ].T
@@ -2487,9 +2467,7 @@ def _warmup_cubic_linear_families(
                                     if backend == "marlin"
                                     else canonical
                                 )
-                                _validate_cubic_resident_output(
-                                    resident(), expected()
-                                )
+                                _validate_cubic_resident_output(resident(), expected())
                             except AssertionError as error:
                                 cubic_kernels._CUBIC_LINEAR_REJECTED_RESIDENCIES[
                                     _linear_residency_backend_key(
@@ -2565,12 +2543,16 @@ def _synthetic_routes(
         generator = torch.Generator(device="cuda").manual_seed(
             0xC0B1C + tokens * 131 + top_k * 17 + layer.global_num_experts
         )
-        topk_ids = torch.rand(
-            tokens,
-            layer.global_num_experts,
-            device="cuda",
-            generator=generator,
-        ).topk(top_k, dim=1, sorted=False).indices.to(torch.int32)
+        topk_ids = (
+            torch.rand(
+                tokens,
+                layer.global_num_experts,
+                device="cuda",
+                generator=generator,
+            )
+            .topk(top_k, dim=1, sorted=False)
+            .indices.to(torch.int32)
+        )
     else:
         local = (expert_map >= 0).nonzero().flatten().to(torch.int32)
         remote = (expert_map < 0).nonzero().flatten().to(torch.int32)
@@ -2837,9 +2819,7 @@ def _warmup_cubic_moe_families(
                 else 1
             )
             can_calibrate_grouping = (
-                method.dynamic_a8
-                and tokens <= 1024
-                and len(grouping_candidates) > 1
+                method.dynamic_a8 and tokens <= 1024 and len(grouping_candidates) > 1
             )
             phase_index = 0
             if can_calibrate_grouping:
@@ -2897,8 +2877,7 @@ def _warmup_cubic_moe_families(
                     ),
                     compact_metadata=compact_metadata,
                     metadata_format=(
-                        (w13_compact_metadata.format * 4)
-                        + w2_compact_metadata.format
+                        (w13_compact_metadata.format * 4) + w2_compact_metadata.format
                         if w13_compact_metadata is not None
                         and w2_compact_metadata is not None
                         else 0

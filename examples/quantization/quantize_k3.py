@@ -278,7 +278,6 @@ def _record_quant_loss_stats(
     q: torch.Tensor,
 ) -> None:
     """Accumulate final-format errors without synchronizing the GPU."""
-
     key = f"{bits}@{group_size}"
     bucket = QUANT_LOSS_STATS.get(key)
     if bucket is None:
@@ -326,7 +325,6 @@ def _record_quant_loss_stats(
 
 def _quant_loss_stats_snapshot() -> dict[str, dict[str, int | float]]:
     """Synchronize once per completed source shard and return plain scalars."""
-
     result: dict[str, dict[str, int | float]] = {}
     for key, bucket in QUANT_LOSS_STATS.items():
         result[key] = {

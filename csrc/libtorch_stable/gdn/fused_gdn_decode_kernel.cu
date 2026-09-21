@@ -4,6 +4,7 @@
  */
 
 #include <cstdint>
+#include <string>
 #include <type_traits>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -157,7 +158,7 @@ __device__ __forceinline__ Sum2 warp_reduce_sum_pair(float x, float y) {
   return {x, y};
 }
 
-template <typename StateT, int ValueHeadsPerKeyHead>
+template <typename StateT, int ValueHeadsPerKeyHead, bool SigmoidGate>
 __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
     const __nv_bfloat16* __restrict__ mixed_qkv,
     const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b,
@@ -234,11 +235,9 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
     }
     const Sum2 qk_sums = warp_reduce_sum_pair(q_square, k_square);
     const float q_scale = __shfl_sync(
-        0xffffffffu,
-        lane == 0 ? scale / sqrtf(qk_sums.x + 1.0e-6f) : 0.0f, 0);
+        0xffffffffu, lane == 0 ? scale / sqrtf(qk_sums.x + 1.0e-6f) : 0.0f, 0);
     const float k_scale = __shfl_sync(
-        0xffffffffu,
-        lane == 0 ? 1.0f / sqrtf(qk_sums.y + 1.0e-6f) : 0.0f, 0);
+        0xffffffffu, lane == 0 ? 1.0f / sqrtf(qk_sums.y + 1.0e-6f) : 0.0f, 0);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int dim = lane + i * 32;
@@ -377,9 +376,11 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int value = lane + i * 32;
-      const float gate = silu_fast(__bfloat162float(
+      const float gate_input = __bfloat162float(
           output_gate[static_cast<int64_t>(token) * strides.gate_row +
-                      value_head * kDimV + value]));
+                      value_head * kDimV + value]);
+      const float gate =
+          SigmoidGate ? sigmoid_fast(gate_input) : silu_fast(gate_input);
       const float weight =
           norm_weight_is_bf16
               ? __bfloat162float(
@@ -393,7 +394,7 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
   }
 }
 
-template <typename StateT, int ValueHeadsPerKeyHead>
+template <typename StateT, int ValueHeadsPerKeyHead, bool SigmoidGate>
 void launch_gdn_decode_post_conv_mtp(
     torch::stable::Tensor const& mixed_qkv, torch::stable::Tensor const& a_log,
     torch::stable::Tensor const& dt_bias,
@@ -418,7 +419,7 @@ void launch_gdn_decode_post_conv_mtp(
       get_current_cuda_stream(mixed_qkv.get_device_index());
   const int num_requests = static_cast<int>(state_indices.size(0));
   const dim3 grid(num_requests, num_value_heads);
-  gdn_decode_post_conv_mtp_kernel<StateT, ValueHeadsPerKeyHead>
+  gdn_decode_post_conv_mtp_kernel<StateT, ValueHeadsPerKeyHead, SigmoidGate>
       <<<grid, kThreads, 0, stream>>>(
           static_cast<const __nv_bfloat16*>(mixed_qkv.data_ptr()), a, b,
           static_cast<const float*>(a_log.data_ptr()), dt_bias.data_ptr(),
@@ -448,7 +449,7 @@ void fused_gdn_decode_post_conv_mtp(
     torch::stable::Tensor const& num_accepted_tokens,
     torch::stable::Tensor& state, torch::stable::Tensor const& output_gate,
     torch::stable::Tensor const& norm_weight, torch::stable::Tensor& out,
-    double scale, double norm_eps) {
+    double scale, double norm_eps, const std::string& output_gate_activation) {
   using torch::headeronly::ScalarType;
 
   STD_TORCH_CHECK(
@@ -489,6 +490,9 @@ void fused_gdn_decode_post_conv_mtp(
                   "norm_weight must be a CUDA float32 or bfloat16 tensor");
   STD_TORCH_CHECK(out.is_cuda() && out.scalar_type() == ScalarType::BFloat16,
                   "out must be a CUDA bfloat16 tensor");
+  STD_TORCH_CHECK(
+      output_gate_activation == "silu" || output_gate_activation == "sigmoid",
+      "output_gate_activation must be 'silu' or 'sigmoid'");
 
   STD_TORCH_CHECK(mixed_qkv.dim() == 2,
                   "mixed_qkv must have shape [L, 2 * H * 128 + HV * 128]");
@@ -570,8 +574,9 @@ void fused_gdn_decode_post_conv_mtp(
   const auto* b_ptr = static_cast<const __nv_bfloat16*>(b.data_ptr());
   const auto* output_gate_ptr =
       static_cast<const __nv_bfloat16*>(output_gate.data_ptr());
-  const auto launch = [&]<typename StateT, int ValueHeadsPerKeyHead>() {
-    launch_gdn_decode_post_conv_mtp<StateT, ValueHeadsPerKeyHead>(
+  const auto launch = [&]<typename StateT, int ValueHeadsPerKeyHead,
+                          bool SigmoidGate>() {
+    launch_gdn_decode_post_conv_mtp<StateT, ValueHeadsPerKeyHead, SigmoidGate>(
         mixed_qkv, a_log, dt_bias, state_indices, cu_seqlens,
         num_accepted_tokens, state, norm_weight, out, a_ptr, b_ptr,
         output_gate_ptr, num_key_heads, num_value_heads, scale, norm_eps,
@@ -579,9 +584,18 @@ void fused_gdn_decode_post_conv_mtp(
   };
   const auto dispatch_state_type = [&]<int ValueHeadsPerKeyHead>() {
     if (state_scalar_type == ScalarType::Float) {
-      launch.template operator()<float, ValueHeadsPerKeyHead>();
+      if (output_gate_activation == "sigmoid") {
+        launch.template operator()<float, ValueHeadsPerKeyHead, true>();
+      } else {
+        launch.template operator()<float, ValueHeadsPerKeyHead, false>();
+      }
     } else {
-      launch.template operator()<__nv_bfloat16, ValueHeadsPerKeyHead>();
+      if (output_gate_activation == "sigmoid") {
+        launch.template operator()<__nv_bfloat16, ValueHeadsPerKeyHead, true>();
+      } else {
+        launch
+            .template operator()<__nv_bfloat16, ValueHeadsPerKeyHead, false>();
+      }
     }
   };
   switch (value_heads_per_key_head) {

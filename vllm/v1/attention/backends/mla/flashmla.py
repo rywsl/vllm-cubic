@@ -81,14 +81,6 @@ class FlashMLABackend(MLACommonBackend):
         return [64]
 
     @staticmethod
-    def get_kv_cache_stride_order(
-        include_num_layers_dimension: bool = False,
-    ) -> tuple[int, ...]:
-        if include_num_layers_dimension:
-            return (1, 0, 2, 3)
-        return (0, 1, 2)
-
-    @staticmethod
     def get_name() -> str:
         return "FLASHMLA"
 
@@ -162,15 +154,14 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
         self.native_cubic8_cache = cache_dtype == "cubic8"
         if self.fp8_cache_only or self.cubic8_cache:
             self.reorder_batch_threshold = 1
+        if self.cubic8_cache:
             cast(Any, self).query_len_support = QueryLenSupport.SINGLE_ONLY
 
         super().__init__(
             kv_cache_spec, layer_names, vllm_config, device, FlashMLAMetadata
         )
 
-        self.num_q_heads = vllm_config.model_config.get_num_attention_heads(
-            vllm_config.parallel_config
-        )
+        self.num_q_heads = self.num_heads
 
         self.cg_buf_tile_scheduler_metadata = None
         self.cg_buf_num_splits = None
@@ -189,12 +180,14 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
             max_splits = _compute_cache_only_num_kv_splits(
                 self.model_config.max_model_len, num_sms
             )
-            max_seqs = vllm_config.scheduler_config.max_num_seqs
+            max_seqs = (
+                vllm_config.scheduler_config.max_num_seqs * self.reorder_batch_threshold
+            )
             workspace_specs: list[tuple[tuple[int, ...], Any]] = [
                 (
                     (
                         max_seqs,
-                        self.num_q_heads,
+                        self.num_q_heads * self.dcp_world_size,
                         max_splits,
                         self.mla_dims.kv_lora_rank + 1,
                     ),
@@ -292,6 +285,7 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
 
 class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
     can_return_lse_for_decode: bool = True
+    supports_dcp: bool = True
 
     def __init__(
         self,
@@ -362,22 +356,29 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run a model-dtype query against a compressed MLA cache."""
-        assert q.ndim == 3, (
-            "Compressed-cache FlashMLA supports single-token decode; "
-            f"received query shape {tuple(q.shape)}"
-        )
+        assert q.ndim == 3
         assert attn_metadata.decode is not None
+        num_decodes = attn_metadata.decode.seq_lens.shape[0]
+        q_block = reshape_query_for_spec_decode(q, num_decodes)
+        query_len = q_block.shape[1]
+        causal = attn_metadata.causal
+        if causal and query_len > 1:
+            assert self.dcp_world_size == 1, (
+                "causal multi-token compressed MLA requires DCP=1"
+            )
 
         if (
             self._fp8_cache_only
             and q.dtype == torch.bfloat16
+            and q.shape[-1] == 576
+            and kv_c_and_k_pe_cache.shape[1] == 64
             and q.shape[0] * attn_metadata.max_seq_len <= _FP8_Q16_NATIVE_MAX_TOKEN_WORK
         ):
             scheduler = attn_metadata.decode.scheduler_metadata
             assert scheduler.tile_scheduler_metadata is not None
             assert scheduler.num_splits is not None
             output, lse = flash_mla_with_kvcache_fp8_q16(
-                q=q.unsqueeze(1),
+                q=q_block,
                 k_cache=kv_c_and_k_pe_cache.unsqueeze(2),
                 block_table=attn_metadata.decode.block_table,
                 cache_seqlens=attn_metadata.decode.seq_lens,
@@ -386,12 +387,16 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                 num_splits=scheduler.num_splits,
                 descale_k=layer._k_scale.reshape(1),
                 softmax_scale=self.scale,
-                causal=False,
+                causal=causal,
             )
-            return output.squeeze(1), lse.squeeze(-1)
+            return (
+                reshape_attn_output_for_spec_decode(output),
+                lse.transpose(1, 2).reshape(q.shape[0], q.shape[1]).contiguous(),
+            )
 
         if (
             self._native_cubic8_cache
+            and query_len == 1
             and q.dtype == torch.bfloat16
             and q.shape[-1] == 576
             and kv_c_and_k_pe_cache.shape[1] == 64
@@ -400,7 +405,7 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             assert scheduler.tile_scheduler_metadata is not None
             assert scheduler.num_splits is not None
             output, lse = flash_mla_with_kvcache_cubic8(
-                q=q.unsqueeze(1),
+                q=q_block,
                 k_cache=kv_c_and_k_pe_cache.unsqueeze(2),
                 block_table=attn_metadata.decode.block_table,
                 cache_seqlens=attn_metadata.decode.seq_lens,
@@ -408,14 +413,28 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                 tile_scheduler_metadata=scheduler.tile_scheduler_metadata,
                 num_splits=scheduler.num_splits,
                 softmax_scale=self.scale,
-                causal=False,
+                causal=causal,
             )
-            return output.squeeze(1), lse.squeeze(-1)
+            return (
+                reshape_attn_output_for_spec_decode(output),
+                lse.transpose(1, 2).reshape(q.shape[0], q.shape[1]).contiguous(),
+            )
         batch, num_heads, _ = q.shape
+        block_table = attn_metadata.decode.block_table
+        seq_lens = attn_metadata.decode.seq_lens
+        if query_len > 1:
+            block_table = block_table.repeat_interleave(query_len, dim=0)
+            if causal:
+                offsets = torch.arange(
+                    1 - query_len, 1, device=seq_lens.device, dtype=seq_lens.dtype
+                )
+                seq_lens = (seq_lens[:, None] + offsets).flatten().clamp(min=0)
+            else:
+                seq_lens = seq_lens.repeat_interleave(query_len)
         output = torch.zeros(
             batch, num_heads, self.kv_lora_rank, dtype=q.dtype, device=q.device
         )
-        lse = torch.zeros(batch, num_heads, dtype=q.dtype, device=q.device)
+        lse = torch.zeros(batch, num_heads, dtype=torch.float32, device=q.device)
         num_kv_splits = (
             1
             if envs.VLLM_BATCH_INVARIANT
@@ -498,8 +517,8 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                     kv_c_and_k_pe_cache,
                     output,
                     lse,
-                    attn_metadata.decode.block_table,
-                    attn_metadata.decode.seq_lens,
+                    block_table,
+                    seq_lens,
                     attn_logits,
                     materialize_workspace,
                     contiguous_block_table,
@@ -519,8 +538,8 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                     kv_c_and_k_pe_cache,
                     output,
                     lse,
-                    attn_metadata.decode.block_table,
-                    attn_metadata.decode.seq_lens,
+                    block_table,
+                    seq_lens,
                     attn_logits,
                     num_kv_splits,
                     self.scale,
@@ -535,8 +554,8 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             cache[..., : self.kv_lora_rank],
             output,
             lse,
-            attn_metadata.decode.block_table,
-            attn_metadata.decode.seq_lens,
+            block_table,
+            seq_lens,
             attn_logits,
             num_kv_splits,
             self.scale,
@@ -621,7 +640,7 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             query_offset = query_end
 
         assert query_offset == q.shape[0]
-        return torch.cat(outputs, dim=0), torch.cat(lses, dim=0)
+        return torch.cat(outputs, dim=0), torch.cat(lses, dim=0).T.contiguous()
 
     def forward_mqa(
         self,
@@ -705,5 +724,17 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             )
 
         o = reshape_attn_output_for_spec_decode(o)
+
+        if self.need_to_return_lse_for_decode:
+            # FlashMLA returns LSE as [batch, heads, seq_len]; the DCP reducer
+            # consumes [tokens, heads]. Flattening matters under spec-decode,
+            # where seq_len > 1. Only DCP consumes lse, so skip the copy
+            # otherwise.
+            num_decodes, q_num_heads, seq_len = lse.shape
+            lse = (
+                lse.permute(0, 2, 1)
+                .reshape(num_decodes * seq_len, q_num_heads)
+                .contiguous()
+            )
 
         return o, lse

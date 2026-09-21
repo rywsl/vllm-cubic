@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Run independent Cubic correctness tests concurrently across visible GPUs."""
 
 from __future__ import annotations
@@ -59,7 +62,7 @@ def main() -> int:
             environment["OMP_NUM_THREADS"] = str(cpu_threads)
             environment["MKL_NUM_THREADS"] = str(cpu_threads)
             command = (
-                str(repo / "venv/bin/python"),
+                sys.executable,
                 "-m",
                 "pytest",
                 "-q",

@@ -5,6 +5,7 @@
 Run `pytest tests/distributed/test_comm_ops.py`.
 """
 
+from collections import deque
 from collections.abc import Callable
 from typing import Any
 from unittest.mock import Mock
@@ -208,9 +209,14 @@ def send_recv_tensor_dict_test_worker(
 class _DummyWork:
     def __init__(self) -> None:
         self.wait_calls = 0
+        self.completed = False
 
     def wait(self) -> None:
         self.wait_calls += 1
+        self.completed = True
+
+    def is_completed(self) -> bool:
+        return self.completed
 
 
 class _DummyAllGatherGroup:
@@ -235,6 +241,7 @@ def _make_group_for_unit_test(
     g.use_cpu_custom_send_recv = False
     g.device_group = None
     g.cpu_group = None
+    g._pending_isends = deque()
     return g
 
 
@@ -327,6 +334,8 @@ def test_cuda_communicator_groups_independent_pynccl_all_reduces(
     communicator.pynccl_simple_buckets = frozenset()
     communicator.qr_comm = None
     communicator.fi_ar_comm = None
+    communicator.fi_pcie_ipc_ar_comm = None
+    communicator.use_aiter_allreduce = False
     communicator.aiter_ar_comm = None
     communicator.ca_comm = None
     communicator.symm_mem_comm = None
@@ -383,6 +392,8 @@ def test_cuda_communicator_splits_mixed_protocol_batch(
     communicator.pynccl_simple_buckets = frozenset({64 * 1024})
     communicator.qr_comm = None
     communicator.fi_ar_comm = None
+    communicator.fi_pcie_ipc_ar_comm = None
+    communicator.use_aiter_allreduce = False
     communicator.aiter_ar_comm = None
     communicator.ca_comm = None
     communicator.symm_mem_comm = None
@@ -399,6 +410,258 @@ def test_cuda_communicator_splits_mixed_protocol_batch(
     communicator.pynccl_comm.group_start.assert_not_called()
     communicator.pynccl_simple_comm.all_reduce.assert_called_once()
     communicator.pynccl_comm.all_reduce.assert_called_once()
+
+
+def test_cuda_communicator_preserves_pcie_ipc_for_all_reduce_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    communicator = CudaCommunicator.__new__(CudaCommunicator)
+    communicator.pynccl_comm = Mock(disabled=False, world_size=8)
+    communicator.qr_comm = None
+    communicator.fi_ar_comm = None
+    communicator.fi_pcie_ipc_ar_comm = Mock()
+    communicator.fi_pcie_ipc_ar_comm.should_use.return_value = True
+    monkeypatch.setattr(
+        "vllm.distributed.device_communicators.cuda_communicator."
+        "should_nccl_symm_mem_allreduce",
+        lambda *_: False,
+    )
+    inputs = [torch.tensor([1.0]), torch.tensor([2.0])]
+
+    communicator.all_reduce_batch(inputs)
+
+    assert communicator.fi_pcie_ipc_ar_comm.all_reduce.call_count == 2
+    communicator.pynccl_comm.group_start.assert_not_called()
+    communicator.pynccl_comm.all_reduce.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("backend", "capability", "world_size", "nodes", "expected"),
+    [
+        ("mnnvl", 103, 4, 1, 80 * flashinfer_all_reduce.MiB - 1),
+        ("mnnvl", 103, 8, 2, 64 * flashinfer_all_reduce.MiB - 1),
+        ("mnnvl", 103, 16, 4, 8 * flashinfer_all_reduce.MiB - 1),
+        ("mnnvl", 103, 2, 1, None),
+        ("mnnvl", 103, 12, 3, None),
+        ("mnnvl", 103, 8, 1, 64 * flashinfer_all_reduce.MiB - 1),
+        ("trtllm", 103, 8, 2, None),
+        ("mnnvl", 90, 8, 2, None),
+    ],
+)
+def test_flashinfer_standalone_size_tuning(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    capability: int,
+    world_size: int,
+    nodes: int,
+    expected: int | None,
+) -> None:
+    monkeypatch.setattr(
+        flashinfer_all_reduce,
+        "current_platform",
+        Mock(get_device_capability=lambda: Mock(to_int=lambda: capability)),
+    )
+    monkeypatch.setattr(flashinfer_all_reduce, "_node_count", lambda _: nodes)
+
+    assert (
+        flashinfer_all_reduce._get_tuned_standalone_max_size(
+            world_size, backend, Mock()
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(("enabled", "expected"), [(True, 4681), (False, 128)])
+def test_flashinfer_standalone_workspace_size(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool, expected: int
+) -> None:
+    create_workspace = Mock(return_value=Mock(backend="mnnvl"))
+    monkeypatch.setattr(
+        flashinfer_all_reduce.envs, "VLLM_ALLREDUCE_USE_FLASHINFER", enabled
+    )
+    monkeypatch.setattr(flashinfer_all_reduce, "_fi_ar_workspace", None)
+    monkeypatch.setattr(flashinfer_all_reduce, "_fi_ar_quant_workspace", None)
+    monkeypatch.setattr(
+        flashinfer_all_reduce,
+        "_resolve_fi_ar_backend",
+        Mock(return_value=("mnnvl", False)),
+    )
+    monkeypatch.setattr(flashinfer_all_reduce, "get_node_count", lambda: 2)
+    monkeypatch.setattr(
+        flashinfer_all_reduce,
+        "_get_tuned_standalone_max_size",
+        Mock(return_value=64 * flashinfer_all_reduce.MiB - 1),
+    )
+    monkeypatch.setattr(flashinfer_all_reduce, "_create_workspace", create_workspace)
+
+    flashinfer_all_reduce.get_fi_ar_workspace(8, 0, 128, 7168, torch.bfloat16, Mock())
+
+    assert create_workspace.call_args.args[3] == expected
+
+
+def test_flashinfer_all_reduce_precedes_nccl(monkeypatch: pytest.MonkeyPatch) -> None:
+    output = torch.empty(2)
+    fi_ar_comm = Mock(disabled=False)
+    fi_ar_comm.should_use_fi_ar.return_value = True
+    fi_ar_comm.all_reduce.return_value = output
+    communicator = CudaCommunicator.__new__(CudaCommunicator)
+    communicator.fi_ar_comm = fi_ar_comm
+    communicator.fi_pcie_ipc_ar_comm = None
+    communicator.pynccl_comm = Mock(world_size=8)
+    communicator.qr_comm = None
+    nccl_selector = Mock(return_value=True)
+    monkeypatch.setattr(
+        "vllm.distributed.device_communicators.cuda_communicator."
+        "should_nccl_symm_mem_allreduce",
+        nccl_selector,
+    )
+
+    assert communicator.all_reduce(torch.empty(1)) is output
+    nccl_selector.assert_not_called()
+
+
+def test_aiter_all_gather_precedes_pynccl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure can use aiter all_gather if available even if pynccl is not available."""
+    output = torch.empty(2)
+    aiter_comm = Mock()
+    aiter_comm.should_custom_ag.return_value = True
+    aiter_comm.custom_all_gather.return_value = output
+    communicator = CudaCommunicator.__new__(CudaCommunicator)
+    communicator.world_size = 2
+    communicator.aiter_ar_comm = aiter_comm
+    communicator.pynccl_comm = Mock(disabled=True)
+    monkeypatch.setattr(communicator, "_can_use_aiter_ag_rs", Mock(return_value=True))
+
+    assert communicator.all_gatherv(torch.empty(1)) is output
+
+
+def test_isend_object_posts_size_then_object_and_releases_on_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted: list[tuple[torch.Tensor, _DummyWork]] = []
+
+    def fake_isend(t: torch.Tensor, *args: Any, **kwargs: Any) -> _DummyWork:
+        w = _DummyWork()
+        posted.append((t, w))
+        return w
+
+    monkeypatch.setattr(torch.distributed, "isend", fake_isend)
+
+    g = _make_group_for_unit_test(rank_in_group=0, world_size=2)
+    handle = g.isend_object({"k": [1, 2, 3]}, dst=1)
+
+    # two sends, in size-then-object order (preserves gloo FIFO).
+    assert len(posted) == 2
+    assert posted[0][0].dtype == torch.long
+    assert posted[0][0].shape == torch.Size([1])
+    assert posted[0][0].item() == posted[1][0].numel()
+    assert posted[1][0].dtype == torch.uint8
+
+    # retain holds both source tensors until wait.
+    assert handle._retained == (posted[0][0], posted[1][0])
+
+    handle.wait()
+
+    # both underlying works drained, retain dropped.
+    assert all(w.wait_calls == 1 for _, w in posted)
+    assert handle._retained == ()
+
+    # wait is idempotent: gloo Work.wait() is single-shot for p2p sends (a
+    # second wait blocks forever), and both the lazy FIFO reap in
+    # ``_reap_completed_isends`` and any explicit isend caller may wait the
+    # same metadata handle.
+    handle.wait()
+    assert all(w.wait_calls == 1 for _, w in posted)
+    assert handle._retained == ()
+
+
+def test_isend_tensor_dict_includes_metadata_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted: list[torch.Tensor] = []
+
+    def fake_isend(t: torch.Tensor, *args: Any, **kwargs: Any) -> _DummyWork:
+        posted.append(t)
+        return _DummyWork()
+
+    monkeypatch.setattr(torch.distributed, "isend", fake_isend)
+
+    g = _make_group_for_unit_test(rank_in_group=0, world_size=2)
+    td = {"a": torch.arange(4, dtype=torch.float32, device="cpu")}
+    handles = g.isend_tensor_dict(td, dst=1)
+
+    # size + object (metadata) + one tensor send.
+    assert len(posted) == 3
+    assert posted[0].dtype == torch.long
+    assert posted[1].dtype == torch.uint8
+    assert posted[2].dtype == torch.float32
+
+    # composite metadata handle + one tensor handle.
+    assert len(handles) == 2
+
+    for handle in handles:
+        handle.wait()
+    assert handles[0]._retained == ()
+
+
+def test_isend_tensor_dict_self_retains_for_fire_and_forget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    works: list[_DummyWork] = []
+
+    def fake_isend(t: torch.Tensor, *args: Any, **kwargs: Any) -> _DummyWork:
+        w = _DummyWork()
+        works.append(w)
+        return w
+
+    monkeypatch.setattr(torch.distributed, "isend", fake_isend)
+
+    g = _make_group_for_unit_test(rank_in_group=0, world_size=2)
+    td = {"a": torch.arange(4, dtype=torch.float32, device="cpu")}
+
+    # fire-and-forget: the returned handles are dropped by the caller, so the
+    # group must self-retain the handles and the source tensor.
+    g.isend_tensor_dict(td, dst=1)
+    assert len(g._pending_isends) == 1
+    handles0, tensors0 = g._pending_isends[0]
+    assert len(handles0) == 2  # metadata composite + one tensor send
+    assert tensors0 == [td["a"]]
+
+    # the first send is still in flight, so the next call's reap keeps it.
+    g.isend_tensor_dict(td, dst=1)
+    assert len(g._pending_isends) == 2
+
+    # metadata-only send (no tensors) is dropped best-effort on the next
+    # reap, since it has no reliable completion signal.
+    g.isend_tensor_dict({"meta": "no-tensors"}, dst=1)
+    assert len(g._pending_isends) == 3
+
+    # complete every posted work; the next call reaps all three old entries
+    # (the metadata-only one unconditionally) and keeps only its own.
+    for w in works:
+        w.completed = True
+    g.isend_tensor_dict(td, dst=1)
+    assert len(g._pending_isends) == 1
+    # reaped entries had their metadata handles waited as a backstop.
+    assert handles0[0]._retained == ()
+
+
+def test_send_tensor_dict_sync_path_does_not_self_retain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_isend(t: torch.Tensor, *args: Any, **kwargs: Any) -> _DummyWork:
+        return _DummyWork()
+
+    monkeypatch.setattr(torch.distributed, "isend", fake_isend)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(GroupCoordinator, "send_object", lambda self, obj, dst: None)
+
+    g = _make_group_for_unit_test(rank_in_group=0, world_size=2)
+    td = {"a": torch.arange(4, dtype=torch.float32, device="cpu")}
+    g.send_tensor_dict(td, dst=1)
+
+    # the sync path waited every handle, so no retention entry may leak.
+    assert len(g._pending_isends) == 0
 
 
 def test_async_intermediate_tensors_lazy_wait() -> None:

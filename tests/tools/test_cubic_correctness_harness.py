@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import json
 import sys
 from argparse import Namespace
@@ -25,9 +28,7 @@ def test_compare_exact_rejects_any_float_difference():
 
     errors = HARNESS.compare_exact(reference, candidate)
 
-    assert errors == [
-        "position 0: target logprob -0.25 != -0.2500000001"
-    ]
+    assert errors == ["position 0: target logprob -0.25 != -0.2500000001"]
 
 
 def test_compare_exact_rejects_topk_set_and_token_difference():
@@ -51,9 +52,7 @@ def test_variant_matrix_rejects_batch_only_difference():
         "batch2_solo_0": baseline,
         "batch2_concurrent_0": baseline,
     }
-    captures = {
-        variant.name: dict(cases) for variant in HARNESS.VARIANTS
-    }
+    captures = {variant.name: dict(cases) for variant in HARNESS.VARIANTS}
     captures["mtp1_prefix_on"]["batch2_concurrent_0"] = changed
 
     errors = HARNESS.compare_variant_matrix(captures)
@@ -90,9 +89,7 @@ def test_source_fingerprint_changes_with_untracked_runtime_file(tmp_path):
     )
     tracked = repo / "tracked.txt"
     tracked.write_text("tracked")
-    HARNESS.subprocess.run(
-        ("git", "-C", str(repo), "add", "tracked.txt"), check=True
-    )
+    HARNESS.subprocess.run(("git", "-C", str(repo), "add", "tracked.txt"), check=True)
     HARNESS.subprocess.run(
         ("git", "-C", str(repo), "commit", "-qm", "initial"), check=True
     )
@@ -182,16 +179,12 @@ def test_reused_bf16_captures_require_exactly_compatible_report(tmp_path):
         extra_bf16_serve_arg=[],
     )
 
-    captures = HARNESS.load_reused_bf16_captures(
-        report_path, "source", args, variants
-    )
+    captures = HARNESS.load_reused_bf16_captures(report_path, "source", args, variants)
 
     assert set(captures) == {variant.name for variant in variants}
     args.seed = 8
     with pytest.raises(RuntimeError, match="incompatible seed"):
-        HARNESS.load_reused_bf16_captures(
-            report_path, "source", args, variants
-        )
+        HARNESS.load_reused_bf16_captures(report_path, "source", args, variants)
 
 
 def test_performance_is_blocked_by_any_missing_strict_case():
@@ -289,7 +282,9 @@ def test_skip_bf16_is_fail_closed_for_bf16_coverage(monkeypatch, tmp_path):
 
 def test_capture_checkpoint_reuses_only_an_exact_identity(tmp_path):
     path = tmp_path / "checkpoint.json"
-    captures = {"mtp0_prefix_off": {"short_fresh": []}}
+    captures: dict[str, dict[str, list[dict]]] = {
+        "mtp0_prefix_off": {"short_fresh": []}
+    }
     identity = {"source_fingerprint": "source", "seed": 7}
     cases = {"cubic": {"identity": identity, "captures": captures}}
 
@@ -411,9 +406,7 @@ def test_render_prompt_preserves_explicit_generation_bound(monkeypatch):
         top_logprobs=20,
     )
 
-    rendered = HARNESS._render_prompt(
-        "http://server", args, "prompt", "served"
-    )
+    rendered = HARNESS._render_prompt("http://server", args, "prompt", "served")
 
     assert rendered["sampling_params"]["max_tokens"] == 16
 
@@ -427,9 +420,7 @@ def test_breadth_capture_stops_before_long_context_and_c8(monkeypatch):
     monkeypatch.setattr(
         HARNESS,
         "_capture_one",
-        lambda base_url, rendered_request: [
-            {"token": rendered_request["prompt"]}
-        ],
+        lambda base_url, rendered_request: [{"token": rendered_request["prompt"]}],
     )
     args = Namespace(capture_profile="breadth", long_context_repetitions=3600)
 
@@ -445,9 +436,7 @@ def test_breadth_capture_stops_before_long_context_and_c8(monkeypatch):
     }
 
 
-def test_multimodal_capture_covers_repeated_and_distinct_images(
-    monkeypatch, tmp_path
-):
+def test_multimodal_capture_covers_repeated_and_distinct_images(monkeypatch, tmp_path):
     images = [tmp_path / "first.png", tmp_path / "second.png"]
     images[0].write_bytes(b"first")
     images[1].write_bytes(b"second")
@@ -459,9 +448,7 @@ def test_multimodal_capture_covers_repeated_and_distinct_images(
     monkeypatch.setattr(
         HARNESS,
         "_capture_one",
-        lambda base_url, rendered_request: [
-            {"token": str(rendered_request["prompt"])}
-        ],
+        lambda base_url, rendered_request: [{"token": str(rendered_request["prompt"])}],
     )
     args = Namespace(
         capture_profile="multimodal",

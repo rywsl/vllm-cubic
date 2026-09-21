@@ -12,6 +12,9 @@ mirror ``fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_{bf16,fp8}_insert``.
 - ``fused_mla_qkv_quant_kv_cache_fp8_insert`` (fp8): additionally quantize
   ``q``/``k``/``v`` to E4M3 with ``q_scale`` / ``k_scale`` / ``v_scale`` (the
   cache shares ``k_scale``, as in ``concat_and_cache_mla``).
+- ``fused_mla_kv_concat`` / ``fused_mla_kv_concat_quant_fp8`` (chunked context):
+  the same K concat (plus the fp8 K/V cast) without the cache insert, for context
+  chunks whose latent was gathered back out of the paged cache.
 
 The optional ``positions`` / ``cos_sin_cache`` pair enables GPT-J-style RoPE
 inside the epilogue. Omitting both keeps the K3 NoPE fast path. The kernels use
@@ -20,6 +23,46 @@ sm_90+.
 """
 
 import torch
+
+
+def _rotate_cubic8_inputs(
+    q_pe: torch.Tensor,
+    k_pe: torch.Tensor,
+    positions: torch.Tensor | None,
+    cos_sin_cache: torch.Tensor | None,
+) -> None:
+    if positions is None:
+        assert cos_sin_cache is None
+        return
+    assert cos_sin_cache is not None
+    cos, sin = cos_sin_cache[positions].chunk(2, dim=-1)
+    for tensor in (q_pe, k_pe):
+        shape = (positions.numel(),) + (1,) * (tensor.ndim - 2) + (-1,)
+        c, s = cos.view(shape), sin.view(shape)
+        even, odd = tensor[..., ::2].float(), tensor[..., 1::2].float()
+        rotated = torch.stack((even * c - odd * s, odd * c + even * s), dim=-1)
+        tensor.copy_(rotated.flatten(-2))
+
+
+def fused_mla_key_concat_kv_cache_cubic8_insert(
+    q: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor | None = None,
+    cos_sin_cache: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Keep prefill Q/K in model dtype and write groupwise Cubic8 storage."""
+    from vllm.v1.attention.ops.cubic8_mla import concat_and_cache_mla_cubic8
+
+    k_pe = k_pe.reshape(k_pe.shape[0], -1)
+    _rotate_cubic8_inputs(q[..., k_nope.shape[-1] :], k_pe, positions, cos_sin_cache)
+    k = fused_mla_kv_concat(k_nope, k_pe)
+    if q.shape[0]:
+        concat_and_cache_mla_cubic8(kv_c_normed, k_pe, kv_cache, slot_mapping)
+    return k
 
 
 def fused_mla_key_concat_kv_cache_insert(
@@ -109,9 +152,9 @@ def fused_mla_key_concat_ds_mla_insert(
     """Concat full K (bf16) and insert the latent in the fp8_ds_mla layout.
 
     The cache uses DeepSeek's 656-byte block-scaled layout (NoPE in 4 tiles of
-    128 with per-tile dynamic fp8 scales, RoPE as bf16) -- self-scaling, so no
-    scale argument. Returns the bf16 full key; optionally rotates ``q`` and
-    writes ``kv_cache`` in place.
+    128 with per-tile power-of-two scales stored as float32, RoPE as bf16) --
+    self-scaling, so no scale argument. Returns the bf16 full key; optionally
+    rotates ``q`` and writes ``kv_cache`` in place.
     """
     k_pe = k_pe.reshape(k_pe.shape[0], -1)
     tp, num_heads, qk_nope_head_dim = k_nope.shape
@@ -192,6 +235,59 @@ def fused_mla_qkv_quant_kv_cache_fp8_insert(
     return q_fp8, k_fp8, v_fp8
 
 
+def _empty_full_key(
+    k_nope: torch.Tensor, k_pe: torch.Tensor, dtype: torch.dtype
+) -> torch.Tensor:
+    num_tokens, num_heads, qk_nope_head_dim = k_nope.shape
+    return torch.empty(
+        (num_tokens, num_heads, qk_nope_head_dim + k_pe.shape[1]),
+        dtype=dtype,
+        device=k_nope.device,
+    )
+
+
+def fused_mla_kv_concat(
+    k_nope: torch.Tensor,  # [T, H, qk_nope_head_dim], may be strided
+    k_pe: torch.Tensor,  # [T, rope] or [T, 1, rope], same dtype as k_nope
+) -> torch.Tensor:
+    """Concat ``k = [k_nope | k_pe]`` into a contiguous key, in one launch.
+
+    The chunked-context counterpart of ``fused_mla_key_concat_kv_cache_insert``:
+    no query, no cache insert and no RoPE (the gathered ``k_pe`` is already
+    rotated). ``k_nope`` is a strided half of one ``kv_b_proj`` output and
+    ``k_pe`` a strided view of the gather workspace, so neither has to be made
+    contiguous first.
+    """
+    k_pe = k_pe.reshape(k_pe.shape[0], k_pe.shape[-1])
+    k = _empty_full_key(k_nope, k_pe, k_nope.dtype)
+    if k.shape[0]:
+        torch.ops._C.fused_kimi_k3_mla_kv_concat(k_nope, k_pe, k)
+    return k
+
+
+def fused_mla_kv_concat_quant_fp8(
+    k_nope: torch.Tensor,  # [T, H, qk_nope_head_dim], may be strided
+    k_pe: torch.Tensor,  # [T, rope] or [T, 1, rope], k_nope's dtype or fp8
+    v: torch.Tensor,  # [T, H, v_head_dim], may be strided
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``fused_mla_kv_concat`` plus an fp8 cast of the key and of ``v``.
+
+    ``k_pe`` may already be fp8: a plain fp8 cache is gathered without
+    dequantizing, and those bytes are copied through as-is.
+
+    Returns contiguous ``(k_fp8, v_fp8)``.
+    """
+    k_pe = k_pe.reshape(k_pe.shape[0], k_pe.shape[-1])
+    fp8 = torch.float8_e4m3fn
+    k_fp8 = _empty_full_key(k_nope, k_pe, fp8)
+    v_fp8 = torch.empty(v.shape, dtype=fp8, device=v.device)
+    if k_fp8.shape[0]:
+        torch.ops._C.fused_kimi_k3_mla_kv_concat_quant_fp8(
+            k_nope, k_pe, v, k_fp8, v_fp8
+        )
+    return k_fp8, v_fp8
+
+
 def fused_mla_decode_q_concat_kv_cache_insert(
     ql_nope: torch.Tensor,  # [B, H, kv_lora_rank]  (BMM1 output, absorbed q)
     q_pe: torch.Tensor,  # [B, H, qk_rope_head_dim]
@@ -201,6 +297,7 @@ def fused_mla_decode_q_concat_kv_cache_insert(
     slot_mapping: torch.Tensor,  # [B] int64
     *,
     ds_mla: bool = False,
+    cubic8: bool = False,
     q_scale_inv: torch.Tensor | None = None,  # scalar fp32, 1 / q scale
     cache_scale_inv: torch.Tensor | None = None,  # scalar fp32, 1 / kv scale
     positions: torch.Tensor | None = None,  # [B] int64
@@ -227,7 +324,14 @@ def fused_mla_decode_q_concat_kv_cache_insert(
     if b == 0:
         return mqa_q
 
-    if ds_mla:
+    if cubic8:
+        from vllm.v1.attention.ops.cubic8_mla import concat_and_cache_mla_cubic8
+
+        assert not ds_mla and not fp8_q
+        _rotate_cubic8_inputs(q_pe, k_pe, positions, cos_sin_cache)
+        mqa_q.copy_(torch.cat((ql_nope, q_pe), dim=-1))
+        concat_and_cache_mla_cubic8(kv_c_normed, k_pe, kv_cache, slot_mapping)
+    elif ds_mla:
         cache = (
             kv_cache if kv_cache.dtype == torch.uint8 else kv_cache.view(torch.uint8)
         )

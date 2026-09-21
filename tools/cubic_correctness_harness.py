@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Run BF16 and Cubic numerical-correctness gates before performance work.
 
 This harness treats every source-tree change as invalidating prior numerical
@@ -16,7 +19,6 @@ pass.
 from __future__ import annotations
 
 import argparse
-import base64
 import dataclasses
 import hashlib
 import json
@@ -35,6 +37,8 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from typing import Any
+
+import pybase64 as base64
 
 
 @dataclasses.dataclass(frozen=True)
@@ -69,8 +73,8 @@ REQUIRED_CUBIC_CASES = frozenset(
 )
 
 DEFAULT_KERNEL_COMMANDS = (
-    "venv/bin/python tools/run_cubic_correctness_gates.py",
-    "venv/bin/python tools/check_cubic_downstream.py",
+    f"{sys.executable} tools/run_cubic_correctness_gates.py",
+    f"{sys.executable} tools/check_cubic_downstream.py",
 )
 
 
@@ -144,9 +148,7 @@ def normalize_response(response: dict[str, Any]) -> list[dict[str, Any]]:
     content = response["choices"][0]["logprobs"]["content"]
     normalized = []
     for position in content:
-        top = {
-            _token_key(item): item["logprob"] for item in position["top_logprobs"]
-        }
+        top = {_token_key(item): item["logprob"] for item in position["top_logprobs"]}
         normalized.append(
             {
                 "token": _token_key(position),
@@ -168,8 +170,7 @@ def compare_exact(
     for index, (expected, actual) in enumerate(zip(reference, candidate)):
         if expected["token"] != actual["token"]:
             errors.append(
-                f"position {index}: token {expected['token']!r} != "
-                f"{actual['token']!r}"
+                f"position {index}: token {expected['token']!r} != {actual['token']!r}"
             )
         if expected["logprob"] != actual["logprob"]:
             errors.append(
@@ -407,8 +408,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("--capture-max-tokens must be positive")
     if args.capture_profile == "multimodal" and len(args.capture_image) != 2:
         parser.error(
-            "--capture-profile multimodal requires exactly two "
-            "--capture-image fixtures"
+            "--capture-profile multimodal requires exactly two --capture-image fixtures"
         )
     missing_images = [path for path in args.capture_image if not path.is_file()]
     if missing_images:
@@ -717,9 +717,7 @@ def capture_variant(
                 for prompt in prompts
             ]
             for index, rendered in enumerate(rendered_requests):
-                capture[f"{batch_name}_solo_{index}"] = _capture_one(
-                    base_url, rendered
-                )
+                capture[f"{batch_name}_solo_{index}"] = _capture_one(base_url, rendered)
             barrier = threading.Barrier(2)
             with ThreadPoolExecutor(max_workers=2) as executor:
                 results = list(
@@ -739,16 +737,13 @@ def capture_variant(
     prompts = [("short", short_prompt)]
     if args.capture_profile == "full":
         long_prompt = (
-            "这是用于数值一致性审计的固定上下文。"
-            * args.long_context_repetitions
+            "这是用于数值一致性审计的固定上下文。" * args.long_context_repetitions
         ) + "请总结上述上下文并解释矩阵乘法分块。"
         prompts.append(("long", long_prompt))
     capture = {}
     for prompt_name, prompt in prompts:
         rendered = _render_prompt(base_url, args, prompt, served_model_name)
-        capture[f"{prompt_name}_fresh"] = _capture_one(
-            base_url, rendered
-        )
+        capture[f"{prompt_name}_fresh"] = _capture_one(base_url, rendered)
         capture[f"{prompt_name}_hit"] = _capture_one(base_url, rendered)
 
     batch_sizes = (2, 8) if args.capture_profile == "full" else (2,)
@@ -819,8 +814,7 @@ def main() -> int:
         expected = report["source_fingerprint"]
         if current != expected:
             raise RuntimeError(
-                "report is stale: source fingerprint "
-                f"{current} != audited {expected}"
+                f"report is stale: source fingerprint {current} != audited {expected}"
             )
         print(f"PASS: report remains valid for {current}")
         return 0
@@ -834,12 +828,10 @@ def main() -> int:
         current_bf16_sms,
         args.coverage_report,
     )
-    missing_cubic_cases, missing_bf16_sms = (
-        require_complete_coverage_for_performance(
-            args.performance_command,
-            aggregate_cubic_cases,
-            aggregate_bf16_sms,
-        )
+    missing_cubic_cases, missing_bf16_sms = require_complete_coverage_for_performance(
+        args.performance_command,
+        aggregate_cubic_cases,
+        aggregate_bf16_sms,
     )
     coverage_complete = not missing_cubic_cases and not missing_bf16_sms
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -900,8 +892,7 @@ def main() -> int:
         )
         if not isinstance(captures, dict):
             raise RuntimeError(
-                f"invalid {case_name} capture checkpoint: "
-                f"{capture_checkpoint_path}"
+                f"invalid {case_name} capture checkpoint: {capture_checkpoint_path}"
             )
         all_captures[case_name] = captures
         for variant in args.variants:
@@ -980,9 +971,7 @@ def main() -> int:
         },
         "variants": [dataclasses.asdict(variant) for variant in args.variants],
         "reused_bf16_report": (
-            None
-            if args.reuse_bf16_report is None
-            else str(args.reuse_bf16_report)
+            None if args.reuse_bf16_report is None else str(args.reuse_bf16_report)
         ),
         "correctness_contract": {
             "rtol": STRICT_RTOL,
@@ -1019,12 +1008,9 @@ def main() -> int:
         json.dumps(report, ensure_ascii=False, indent=2)
     )
     if failures:
-        grouped = Counter(
-            failure.split(": position", 1)[0] for failure in failures
-        )
+        grouped = Counter(failure.split(": position", 1)[0] for failure in failures)
         print(
-            f"FAIL: {len(failures)} exact mismatches across "
-            f"{len(grouped)} cases",
+            f"FAIL: {len(failures)} exact mismatches across {len(grouped)} cases",
             file=sys.stderr,
         )
         for case, count in grouped.most_common():

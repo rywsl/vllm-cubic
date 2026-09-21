@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Test batch-invariant matmul against torch.matmul for various shape combinations.
+"""Test batch-invariant matmul against torch.matmul for various shape combinations.
 
 Tests correctness (matches torch.matmul) and batch invariance (result for one
 item doesn't change based on other items in the batch).
@@ -11,10 +10,14 @@ import pytest
 import torch
 from utils import skip_unsupported
 
-from vllm.model_executor.layers.batch_invariant import (
+from vllm.model_executor.determinism.batch_invariant import (
     linear_batch_invariant,
     matmul_batch_invariant,
     use_low_m_batch_invariant,
+)
+from vllm.model_executor.determinism.batch_invariant_configs import (
+    _BATCH_INVARIANT_MATMUL_TUNED_CONFIGS,
+    _get_tuned_matmul_arch_family,
 )
 from vllm.platforms import current_platform
 
@@ -60,9 +63,7 @@ def test_low_m_policy_counts_flattened_token_rows(dtype: torch.dtype) -> None:
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_matmul_correctness(a_shape, b_shape, dtype):
-    """
-    Compare matmul_batch_invariant against torch.matmul for various shapes.
-    """
+    """Compare matmul_batch_invariant against torch.matmul for various shapes."""
     device = torch.device(DEVICE_TYPE)
 
     torch.manual_seed(42)
@@ -94,11 +95,9 @@ def test_matmul_correctness(a_shape, b_shape, dtype):
 @skip_unsupported
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_matmul_batch_invariance(dtype):
-    """
-    Verify that the result for one item is bitwise identical regardless
+    """Verify that the result for one item is bitwise identical regardless
     of what other items are in the batch.
     """
-
     device = torch.device(DEVICE_TYPE)
 
     torch.manual_seed(42)
@@ -129,3 +128,30 @@ def test_linear_batch_invariance_crosses_mtp_row_boundary(dtype):
     batch = linear_batch_invariant(rows, weight)
 
     torch.testing.assert_close(single, batch[:1], rtol=0, atol=0)
+
+
+@skip_unsupported
+@pytest.mark.parametrize("m", [8, 32, 256, 2048])
+@pytest.mark.parametrize("transpose_b", [False, True], ids=["contiguous", "transposed"])
+def test_matmul_batch_invariance_across_tuned_m_buckets(m, transpose_b):
+    # Tuned M buckets must preserve each row's K-reduction order.
+    capability = (
+        current_platform.get_device_capability() if current_platform.is_cuda() else None
+    )
+    arch_family = _get_tuned_matmul_arch_family(capability)
+    if arch_family not in _BATCH_INVARIANT_MATMUL_TUNED_CONFIGS:
+        pytest.skip("No tuned persistent matmul config for this architecture")
+
+    device = torch.device(DEVICE_TYPE)
+    n = k = 2048
+    torch.manual_seed(42)
+    a = torch.rand((m, k), dtype=torch.bfloat16, device=device)
+    if transpose_b:
+        b = torch.rand((n, k), dtype=torch.bfloat16, device=device).t()
+    else:
+        b = torch.rand((k, n), dtype=torch.bfloat16, device=device)
+
+    single_output = matmul_batch_invariant(a[:1], b)
+    batch_output = matmul_batch_invariant(a, b)
+
+    assert torch.equal(single_output[0], batch_output[0])

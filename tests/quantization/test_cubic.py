@@ -40,9 +40,7 @@ def test_cubic_selects_embedding_method_for_vocab_parallel_layer(monkeypatch):
     import vllm.model_executor.layers.vocab_parallel_embedding as vocab_module
 
     monkeypatch.setattr(vocab_module, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(
-        vocab_module, "get_tensor_model_parallel_world_size", lambda: 1
-    )
+    monkeypatch.setattr(vocab_module, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(
         "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0
     )
@@ -196,9 +194,7 @@ def test_cubic_embedding_uses_resident_a16_weight_without_redecoding():
         weight_packed=weight,
         cubic_weight_is_expanded_a16=True,
     )
-    method = CubicEmbeddingMethod(
-        CubicScheme(num_bits=8, group_size=4, group_out=1)
-    )
+    method = CubicEmbeddingMethod(CubicScheme(num_bits=8, group_size=4, group_out=1))
     ids = torch.tensor([[5, 1, 3], [0, 2, 4]])
 
     actual = method.embedding(layer, ids)
@@ -219,12 +215,8 @@ def test_cubic_curve2_embedding_zeros_ids_not_owned_by_tp_rank():
             torch.ones((outputs, 1), device=device),
             torch.zeros((outputs, 1), device=device, dtype=torch.int64),
         ),
-        "weight_curve_a": torch.ones(
-            (1, 4), device=device, dtype=torch.float16
-        ),
-        "weight_curve_b": torch.zeros(
-            (1, 4), device=device, dtype=torch.float16
-        ),
+        "weight_curve_a": torch.ones((1, 4), device=device, dtype=torch.float16),
+        "weight_curve_b": torch.zeros((1, 4), device=device, dtype=torch.float16),
     }
     for name, tensor in tensors.items():
         layer.register_parameter(name, torch.nn.Parameter(tensor, False))
@@ -252,14 +244,10 @@ def test_cubic_curve2_embedding_zeros_ids_not_owned_by_tp_rank():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def _encode_e5m9_curve2(
-    scale: torch.Tensor, curve_id: torch.Tensor
-) -> torch.Tensor:
+def _encode_e5m9_curve2(scale: torch.Tensor, curve_id: torch.Tensor) -> torch.Tensor:
     scale_bits = scale.half().contiguous().view(torch.int16).int()
     scale_code = torch.bitwise_right_shift(scale_bits, 1)
-    return (
-        scale_code | torch.bitwise_left_shift(curve_id.int(), 14)
-    ).to(torch.uint16)
+    return (scale_code | torch.bitwise_left_shift(curve_id.int(), 14)).to(torch.uint16)
 
 
 def test_cubic_e5m9_curve2_metadata_decodes_logical_partitions():
@@ -286,17 +274,13 @@ def test_cubic_e5m9_curve2_metadata_decodes_logical_partitions():
     torch.testing.assert_close(actual_scale, scale, rtol=0, atol=0)
     torch.testing.assert_close(
         actual_a,
-        torch.tensor(
-            [[1.0, 0.75], [0.5, 0.25], [1.25, 1.0]], dtype=torch.float16
-        ),
+        torch.tensor([[1.0, 0.75], [0.5, 0.25], [1.25, 1.0]], dtype=torch.float16),
         rtol=0,
         atol=0,
     )
     torch.testing.assert_close(
         actual_b,
-        torch.tensor(
-            [[0.0, 0.25], [0.5, 0.75], [-0.25, 0.0]], dtype=torch.float16
-        ),
+        torch.tensor([[0.0, 0.25], [0.5, 0.75], [-0.25, 0.0]], dtype=torch.float16),
         rtol=0,
         atol=0,
     )
@@ -387,9 +371,11 @@ def test_cubic_e5m9_curve2_kernel_matches_expanded_metadata(
     group_size = 32
     generator = torch.Generator(device=device).manual_seed(bits)
     if bits == 1:
-        codes = torch.randint(
-            0, 2, (outputs, inputs), generator=generator, device=device
-        ) * 2 - 1
+        codes = (
+            torch.randint(0, 2, (outputs, inputs), generator=generator, device=device)
+            * 2
+            - 1
+        )
     else:
         magnitude_max = (1 << (bits - 1)) - 1
         codes = torch.randint(
@@ -401,14 +387,10 @@ def test_cubic_e5m9_curve2_kernel_matches_expanded_metadata(
         )
     packed = pack_cubic_codes(codes, bits)
     metadata_shape = (outputs, inputs // group_size)
-    curve_id = torch.randint(
-        0, 4, metadata_shape, generator=generator, device=device
-    )
+    curve_id = torch.randint(0, 4, metadata_shape, generator=generator, device=device)
     scale = torch.full(metadata_shape, 0.03125, device=device)
     metadata = _encode_e5m9_curve2(scale, curve_id)
-    curve_a = torch.tensor(
-        [[1.0, 0.75, 0.5, 0.25]], dtype=torch.float16, device=device
-    )
+    curve_a = torch.tensor([[1.0, 0.75, 0.5, 0.25]], dtype=torch.float16, device=device)
     curve_b = torch.tensor(
         [[0.0, 0.125, 0.25, 0.375]], dtype=torch.float16, device=device
     )
@@ -585,7 +567,7 @@ def test_cubic_resident_a16_uses_batch_invariant_linear(monkeypatch):
         return x @ weight.T if bias is None else x @ weight.T + bias
 
     monkeypatch.setattr(
-        "vllm.model_executor.layers.batch_invariant.linear_batch_invariant",
+        "vllm.model_executor.determinism.batch_invariant.linear_batch_invariant",
         batch_invariant_linear,
     )
     monkeypatch.setattr(
@@ -1288,6 +1270,73 @@ def test_cubic_a8_replaces_packed_codes_with_runtime_carrier(bits: int):
     )
 
 
+@pytest.mark.parametrize("mode", ["exact", "a16", "a8"])
+def test_cubic_marlin_preparation_preserves_repack_codes_and_shape(monkeypatch, mode):
+    """Exercise preparation through the real Python wrapper without CUDA."""
+    from vllm.model_executor.layers.quantization.cubic import (
+        prepare_cubic_exact_marlin_weight,
+        prepare_cubic_marlin_weight,
+    )
+    from vllm.model_executor.layers.quantization.utils import marlin_utils
+
+    n, k, group_size = 128, 128, 32
+    bits = 4 if mode == "exact" else 8
+    codes = torch.arange(n * k).reshape(n, k).remainder(15).sub(7).to(torch.int8)
+    packed = pack_cubic_codes(codes, bits) if mode == "exact" else codes
+    original = packed.clone()
+    scale = torch.ones(n, k // group_size)
+    repacked = torch.empty(k // 16, n * 16 // (32 // bits), dtype=torch.int32)
+    calls = []
+
+    def fake_repack(qweight, size_k, size_n, num_bits, is_a_8bit):
+        calls.append((size_k, size_n, num_bits, is_a_8bit))
+        expected = (
+            packed.bitwise_xor(0x88)
+            if mode == "exact"
+            else (codes.to(torch.int16) + 128).to(torch.uint8)
+            if mode == "a16"
+            else codes.view(torch.uint8)
+        )
+        assert qweight.shape == (k // (32 // bits), n)
+        assert qweight.is_contiguous()
+        torch.testing.assert_close(qweight.T.contiguous().view(torch.uint8), expected)
+        return repacked
+
+    monkeypatch.setattr(torch.ops._C, "gptq_marlin_repack", fake_repack, raising=False)
+    monkeypatch.setattr(marlin_utils, "check_marlin_supported", lambda *_: True)
+    monkeypatch.setattr(
+        marlin_utils,
+        "marlin_make_workspace_new",
+        lambda device: torch.zeros(32, dtype=torch.int32, device=device),
+    )
+    if mode == "exact":
+        prepared = prepare_cubic_exact_marlin_weight(
+            packed,
+            scale,
+            torch.ones_like(scale),
+            torch.zeros_like(scale),
+            params_dtype=torch.bfloat16,
+            num_bits=4,
+            group_size=group_size,
+            group_out=1,
+            input_size=k,
+        )
+    else:
+        prepared = prepare_cubic_marlin_weight(
+            packed,
+            scale,
+            params_dtype=torch.bfloat16,
+            group_size=group_size,
+            group_out=1,
+            dynamic_a8=mode == "a8",
+        )
+
+    assert prepared is not None
+    assert prepared.weight is repacked
+    assert calls == [(k, n, bits, mode == "a8")]
+    torch.testing.assert_close(packed, original)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("bits", range(1, 9))
 @pytest.mark.parametrize("group_out", [1, 32])
@@ -1860,12 +1909,18 @@ def test_cubic_regex_target_matches_top_level_submodel_prefix():
         assert config._scheme_for(layer, prefix).num_bits == 8  # noqa: SLF001
         assert config.has_explicit_scheme(prefix)
 
-    assert config._scheme_for(  # noqa: SLF001
-        layer, "audiovisual.blocks.0.attn.proj"
-    ) is None
-    assert config._scheme_for(  # noqa: SLF001
-        layer, "visual.blocks.1.attn.proj"
-    ) is None
+    assert (
+        config._scheme_for(  # noqa: SLF001
+            layer, "audiovisual.blocks.0.attn.proj"
+        )
+        is None
+    )
+    assert (
+        config._scheme_for(  # noqa: SLF001
+            layer, "visual.blocks.1.attn.proj"
+        )
+        is None
+    )
 
 
 def test_cubic_anchored_regex_overrides_broad_base_model_regex():
@@ -2616,21 +2671,15 @@ def test_cubic_e5m9_carrier_preserves_online_a8_codes(
         codes = torch.where(codes >= 0, 1, -1)
     packed = pack_cubic_codes(codes, bits)
     metadata_shape = (outputs, inputs // group_size)
-    curve_id = torch.randint(
-        0, 4, metadata_shape, generator=generator, device=device
-    )
+    curve_id = torch.randint(0, 4, metadata_shape, generator=generator, device=device)
     scale = torch.full(metadata_shape, 0.03125, device=device)
     metadata = _encode_e5m9_curve2(scale, curve_id)
-    curve_a = torch.tensor(
-        [[1.0, 0.75, 0.5, 0.25]], dtype=torch.float16, device=device
-    )
+    curve_a = torch.tensor([[1.0, 0.75, 0.5, 0.25]], dtype=torch.float16, device=device)
     curve_b = torch.tensor(
         [[0.0, 0.125, 0.25, 0.375]], dtype=torch.float16, device=device
     )
     global_index = torch.zeros(outputs, device=device, dtype=torch.uint8)
-    x = torch.randn(
-        1, inputs, generator=generator, device=device, dtype=torch.bfloat16
-    )
+    x = torch.randn(1, inputs, generator=generator, device=device, dtype=torch.bfloat16)
     carrier = materialize_cubic_compact_a8_carrier(
         packed,
         metadata,
@@ -2714,12 +2763,8 @@ def test_cubic_w5_curve2_pair_lut_matches_scalar_decode(tokens: int):
         dtype=torch.int32,
     )
     metadata = _encode_e5m9_curve2(scale, curve_id)
-    curve_a = torch.tensor(
-        [[1.0, 0.8, 1.2, 0.6]], device=device, dtype=torch.float16
-    )
-    curve_b = torch.tensor(
-        [[0.0, 0.1, -0.1, 0.3]], device=device, dtype=torch.float16
-    )
+    curve_a = torch.tensor([[1.0, 0.8, 1.2, 0.6]], device=device, dtype=torch.float16)
+    curve_b = torch.tensor([[0.0, 0.1, -0.1, 0.3]], device=device, dtype=torch.float16)
     global_index = torch.zeros(outputs, device=device, dtype=torch.uint8)
     pair_lut = cubic_w5_curve2_pair_lut(curve_a, curve_b)
     x = torch.randn(
@@ -3283,6 +3328,7 @@ def test_cubic_moe_curve2_metadata_matches_expanded_path(
         cubic_fused_moe,
         cubic_fused_moe_dynamic_a8,
     )
+
     device = torch.device("cuda")
     experts, hidden, intermediate, top_k = 2, 64, 64, 2
     bits, group_size = 6, 32

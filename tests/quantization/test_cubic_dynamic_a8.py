@@ -81,10 +81,14 @@ def _make_codes(shape: tuple[int, ...], bits: int) -> torch.Tensor:
     )
 
 
-def test_cubic_a8_moe_grouping_keeps_small_input_groups_singleton() -> None:
-    from vllm.model_executor.layers.quantization.cubic_kernels import (
-        _cubic_a8_moe_grouping,
-    )
+def test_cubic_a8_moe_grouping_keeps_small_input_groups_singleton(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.quantization import cubic_kernels
+
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(cubic_kernels, "_CUBIC_A8_MOE_GROUPING_TACTICS", {})
+    _cubic_a8_moe_grouping = cubic_kernels._cubic_a8_moe_grouping
 
     assert (
         _cubic_a8_moe_grouping(
@@ -161,9 +165,7 @@ def test_cubic_reduction_equivalence_accepts_one_output_ulp() -> None:
         reference[0], torch.tensor(torch.inf, dtype=torch.bfloat16)
     )
 
-    _assert_cubic_reduction_equivalent(
-        output, reference, allow_route_reduction=True
-    )
+    _assert_cubic_reduction_equivalent(output, reference, allow_route_reduction=True)
 
 
 @pytest.mark.parametrize("nonfinite", (torch.nan, torch.inf, -torch.inf))
@@ -444,6 +446,7 @@ def test_cubic_a8_grouped_routes_preserve_expert_and_padding_indices(
     input_scale = torch.rand(tokens, 1, generator=generator, device=device) * 0.01
     inputs = (values.float() * input_scale).to(torch.bfloat16)
     topk_weights = torch.ones(tokens, top_k, dtype=torch.float32, device=device)
+
     def run(routes_per_block: int) -> torch.Tensor:
         routes_by_expert = ((0, 4), (1, 5), (2, 6), (3, 7))
         sorted_routes: list[int] = []

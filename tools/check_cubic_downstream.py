@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Fail if an upstream sync drops a required vLLM-Cubic contract."""
 
 from __future__ import annotations
@@ -47,7 +50,7 @@ CONTRACTS = (
             "dynamic_a8=envs.VLLM_CUBIC_DYNAMIC_A8",
             "def materialize_cubic_a8_carrier(",
             "def install_cubic_a8_carrier(",
-            'if self.dynamic_a8 and carrier is not None:',
+            "if self.dynamic_a8 and carrier is not None:",
             "if self.scheme.metadata_format == CUBIC_COMPACT_METADATA_FORMAT:",
         ),
     ),
@@ -127,7 +130,7 @@ CONTRACTS = (
     ),
     Contract(
         "low-m-batch-invariant-execution",
-        "vllm/model_executor/layers/batch_invariant.py",
+        "vllm/model_executor/determinism/batch_invariant.py",
         (
             "LOW_M_BATCH_INVARIANT_LIMIT = 8",
             "def use_low_m_batch_invariant(",

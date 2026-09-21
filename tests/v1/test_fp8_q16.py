@@ -16,7 +16,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_fp8_q16_uses_piecewise_cudagraph_boundary():
+def test_fp8_q16_retains_uniform_cudagraph_support():
     from vllm.v1.attention.backends.mla.flashmla import (
         FlashMLAMetadataBuilder,
     )
@@ -24,13 +24,14 @@ def test_fp8_q16_uses_piecewise_cudagraph_boundary():
     spec = SimpleNamespace(cache_dtype_str="fp8_q16")
     assert (
         FlashMLAMetadataBuilder.get_cudagraph_support(SimpleNamespace(), spec)
-        == AttentionCGSupport.NEVER
+        == AttentionCGSupport.UNIFORM_BATCH
     )
 
 
-@pytest.mark.parametrize("query_len", [1, 5])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("query_len", [1, 5, 8])
 @torch.inference_mode()
-def test_native_fp8_q16_shuffled_pages_matches_reference(query_len: int):
+def test_native_fp8_q16_shuffled_pages_matches_reference(query_len: int, causal: bool):
     from vllm.v1.attention.ops.flashmla import (
         flash_mla_with_kvcache_fp8_q16,
         get_mla_metadata_dense_fp8,
@@ -66,19 +67,26 @@ def test_native_fp8_q16_shuffled_pages_matches_reference(query_len: int):
         split_offsets,
         scale,
         softmax_scale=1 / math.sqrt(dim),
+        causal=causal,
     )
 
     reference = []
+    reference_lse = []
     for request in range(batch):
         length = int(lengths[request].item())
         pages = block_table[request, : math.ceil(length / page_size)].long()
         kv = dequant[pages].reshape(-1, dim)[:length]
         scores = query[request].float() @ kv.T / math.sqrt(dim)
+        if causal:
+            visible = length - query_len + torch.arange(query_len, device=device)
+            future = torch.arange(length, device=device)[None, :] > visible[:, None]
+            scores.masked_fill_(future[:, None, :], -torch.inf)
+        reference_lse.append(torch.logsumexp(scores, dim=-1).T)
         reference.append(torch.softmax(scores, dim=-1) @ kv[:, :value_dim])
     reference = torch.stack(reference)
 
     torch.testing.assert_close(output.float(), reference, atol=6e-3, rtol=1.5e-2)
-    assert torch.isfinite(lse).all()
+    torch.testing.assert_close(lse, torch.stack(reference_lse), atol=2e-2, rtol=2e-2)
 
 
 @torch.inference_mode()
@@ -120,9 +128,11 @@ def test_absorbed_fp8_q16_prefill_context_matches_expanded_mla():
     impl.kv_lora_rank = latent_dim
     impl.scale = 1 / math.sqrt(nope_dim + rope_dim)
     metadata = SimpleNamespace(
-        query_lens=[query_len],
-        context_lens=context_lens,
-        context_lens_cpu=[context_len],
+        query_lens_cpu=torch.tensor([query_len], dtype=torch.int32),
+        chunked_context=SimpleNamespace(
+            context_lens=context_lens,
+            context_lens_list=[context_len],
+        ),
         block_table=block_table,
     )
     latent_output, lse = impl._forward_fp8_q16_prefill_context(

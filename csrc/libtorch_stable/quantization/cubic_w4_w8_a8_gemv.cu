@@ -31,8 +31,8 @@ __device__ __forceinline__ int cubic_dp4a_w4_w8(int a, int b, int c) {
   return out;
 }
 
-__device__ __forceinline__ uint4 cubic_ldcs_u32x4(
-    const uint4* __restrict__ address) {
+__device__ __forceinline__ uint4
+cubic_ldcs_u32x4(const uint4* __restrict__ address) {
   uint4 value;
   asm volatile("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
                : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
@@ -43,8 +43,7 @@ __device__ __forceinline__ uint4 cubic_ldcs_u32x4(
 template <CubicMetadataFormat Format>
 __device__ __forceinline__ void cubic_load_metadata(
     const void* __restrict__ primary, const void* __restrict__ secondary,
-    const void* __restrict__ tertiary,
-    const float* __restrict__ scale_global,
+    const void* __restrict__ tertiary, const float* __restrict__ scale_global,
     const float* __restrict__ a_global, const float* __restrict__ b_global,
     int64_t metadata_index, int64_t table_index, float& scale, float& a,
     float& b) {
@@ -71,8 +70,8 @@ __device__ __forceinline__ void cubic_load_metadata(
     if (a_code >= 8) a_code -= 16;
     if (b_code >= 8) b_code -= 16;
     scale = static_cast<float>(scale_code) * scale_global[table_index];
-    a = __half2float(
-        __float2half_rn(1.0f + static_cast<float>(a_code) * a_global[table_index]));
+    a = __half2float(__float2half_rn(1.0f + static_cast<float>(a_code) *
+                                                a_global[table_index]));
     b = __half2float(
         __float2half_rn(static_cast<float>(b_code) * b_global[table_index]));
   }
@@ -84,14 +83,13 @@ __global__ void cubic_w4_w8_compact_a8_gemv_kernel(
     const int8_t* __restrict__ input, const float* __restrict__ input_scale,
     const uint8_t* __restrict__ weight, const void* __restrict__ primary,
     const void* __restrict__ secondary, const void* __restrict__ tertiary,
-    const float* __restrict__ scale_global,
-    const float* __restrict__ a_global, const float* __restrict__ b_global,
-    __nv_bfloat16* __restrict__ output, const float* __restrict__ topk_weights,
-    const int* __restrict__ token_ids, const int* __restrict__ expert_ids,
-    const int* __restrict__ num_routes_ptr, int n, int k, int num_groups,
-    int packed_k, int group_out, int top_k, int route_ctas,
-    int num_valid_tokens, int output_partition_size, int num_partitions,
-    bool multiply_routed_weight) {
+    const float* __restrict__ scale_global, const float* __restrict__ a_global,
+    const float* __restrict__ b_global, __nv_bfloat16* __restrict__ output,
+    const float* __restrict__ topk_weights, const int* __restrict__ token_ids,
+    const int* __restrict__ expert_ids, const int* __restrict__ num_routes_ptr,
+    int n, int k, int num_groups, int packed_k, int group_out, int top_k,
+    int route_ctas, int num_valid_tokens, int output_partition_size,
+    int num_partitions, bool multiply_routed_weight) {
   constexpr int kThreads = 128;
   constexpr int outputs_per_block = kThreads / ThreadsPerOutput;
   constexpr int code_blocks_per_group = GroupSize / 32;
@@ -120,28 +118,28 @@ __global__ void cubic_w4_w8_compact_a8_gemv_kernel(
     const int input_row = token_id / top_k;
     const int64_t expert_output =
         static_cast<int64_t>(expert) * n + out_channel;
-    const int* input_words = reinterpret_cast<const int*>(input) +
-                             static_cast<int64_t>(input_row) * input_words_per_row;
+    const int* input_words =
+        reinterpret_cast<const int*>(input) +
+        static_cast<int64_t>(input_row) * input_words_per_row;
     const int* weight_words =
         reinterpret_cast<const int*>(weight + expert_output * packed_k);
-    const int64_t meta_base =
-        (static_cast<int64_t>(expert) * (n / group_out) +
-         out_channel / group_out) * num_groups;
-    const int partition = min(out_channel / output_partition_size,
-                              num_partitions - 1);
+    const int64_t meta_base = (static_cast<int64_t>(expert) * (n / group_out) +
+                               out_channel / group_out) *
+                              num_groups;
+    const int partition =
+        min(out_channel / output_partition_size, num_partitions - 1);
     const int64_t table_index =
         static_cast<int64_t>(expert) * num_partitions + partition;
     if constexpr (Format == CubicMetadataFormat::Int8Int4Codebook) {
-      const int block_partition = min(
-          (blockIdx.x * outputs_per_block) / output_partition_size,
-          num_partitions - 1);
+      const int block_partition =
+          min((blockIdx.x * outputs_per_block) / output_partition_size,
+              num_partitions - 1);
       const int64_t block_table_index =
           static_cast<int64_t>(expert) * num_partitions + block_partition;
       constexpr int table_entries = 256 * levels;
       const auto* table = static_cast<const int8_t*>(tertiary) +
                           block_table_index * table_entries;
-      for (int entry = threadIdx.x; entry < table_entries;
-           entry += kThreads) {
+      for (int entry = threadIdx.x; entry < table_entries; entry += kThreads) {
         carrier_lut[entry] = table[entry];
       }
       __syncthreads();
@@ -155,9 +153,9 @@ __global__ void cubic_w4_w8_compact_a8_gemv_kernel(
       float b = 0.0f;
       uint8_t packed_ab = 0;
       if (valid_output) {
-        cubic_load_metadata<Format>(
-            primary, secondary, tertiary, scale_global, a_global, b_global,
-            meta, table_index, weight_scale, a, b);
+        cubic_load_metadata<Format>(primary, secondary, tertiary, scale_global,
+                                    a_global, b_global, meta, table_index,
+                                    weight_scale, a, b);
         if constexpr (Format == CubicMetadataFormat::Int8Int4Codebook) {
           packed_ab = static_cast<const uint8_t*>(secondary)[meta];
         }
@@ -219,8 +217,8 @@ __global__ void cubic_w4_w8_compact_a8_gemv_kernel(
                                     : static_cast<int>(raw);
               if (signed_code == -sign_bit) signed_code = 0;
               const int magnitude = abs(signed_code);
-              carrier = carrier_lut[static_cast<int>(packed_ab) * levels +
-                                    magnitude];
+              carrier =
+                  carrier_lut[static_cast<int>(packed_ab) * levels + magnitude];
               if (signed_code < 0) carrier = -carrier;
             } else if constexpr (use_full_signed_lut) {
               carrier = carrier_lut[output_in_block * lut_entries + raw];
@@ -230,7 +228,8 @@ __global__ void cubic_w4_w8_compact_a8_gemv_kernel(
                                     ? static_cast<int>(raw) - (1 << Bits)
                                     : static_cast<int>(raw);
               if (signed_code == -sign_bit) signed_code = 0;
-              carrier = carrier_lut[output_in_block * levels + abs(signed_code)];
+              carrier =
+                  carrier_lut[output_in_block * levels + abs(signed_code)];
               if (signed_code < 0) carrier = -carrier;
             }
             carrier_word |= (static_cast<unsigned>(carrier) & 0xff)
@@ -263,13 +262,12 @@ __global__ void cubic_w4_w8_compact_group_parallel_a8_gemv_kernel(
     const int8_t* __restrict__ input, const float* __restrict__ input_scale,
     const uint8_t* __restrict__ weight, const void* __restrict__ primary,
     const void* __restrict__ secondary, const void* __restrict__ tertiary,
-    const float* __restrict__ scale_global,
-    const float* __restrict__ a_global, const float* __restrict__ b_global,
-    __nv_bfloat16* __restrict__ output, const float* __restrict__ topk_weights,
-    const int* __restrict__ token_ids, const int* __restrict__ expert_ids,
-    const int* __restrict__ num_routes_ptr, int n, int k, int num_groups,
-    int packed_k, int top_k, int route_ctas, int num_valid_tokens,
-    int output_partition_size, int num_partitions,
+    const float* __restrict__ scale_global, const float* __restrict__ a_global,
+    const float* __restrict__ b_global, __nv_bfloat16* __restrict__ output,
+    const float* __restrict__ topk_weights, const int* __restrict__ token_ids,
+    const int* __restrict__ expert_ids, const int* __restrict__ num_routes_ptr,
+    int n, int k, int num_groups, int packed_k, int top_k, int route_ctas,
+    int num_valid_tokens, int output_partition_size, int num_partitions,
     bool multiply_routed_weight) {
   constexpr int kThreads = 128;
   constexpr int kLanesPerOutput = 8;
@@ -306,13 +304,12 @@ __global__ void cubic_w4_w8_compact_group_parallel_a8_gemv_kernel(
       const int route_index = route_block * RoutesPerBlock + route;
       const int token_id = token_ids[route_index];
       token_ids_block[route] = token_id;
-      valid_routes[route] =
-          static_cast<unsigned>(token_id) <
-          static_cast<unsigned>(num_valid_tokens);
+      valid_routes[route] = static_cast<unsigned>(token_id) <
+                            static_cast<unsigned>(num_valid_tokens);
       input_rows[route] = valid_routes[route] ? token_id / top_k : 0;
-      input_words[route] = reinterpret_cast<const int*>(input) +
-                           static_cast<int64_t>(input_rows[route]) *
-                               input_words_per_row;
+      input_words[route] =
+          reinterpret_cast<const int*>(input) +
+          static_cast<int64_t>(input_rows[route]) * input_words_per_row;
     }
     const int expert = expert_ids[route_block];
     if (expert < 0) continue;
@@ -322,16 +319,15 @@ __global__ void cubic_w4_w8_compact_group_parallel_a8_gemv_kernel(
         reinterpret_cast<const int*>(weight + expert_output * packed_k);
     const int64_t meta_base =
         (static_cast<int64_t>(expert) * n + out_channel) * num_groups;
-    const int partition = min(out_channel / output_partition_size,
-                              num_partitions - 1);
+    const int partition =
+        min(out_channel / output_partition_size, num_partitions - 1);
     const int64_t table_index =
         static_cast<int64_t>(expert) * num_partitions + partition;
     if constexpr (use_shared_compact_codebook) {
       constexpr int table_entries = 256 * levels;
       const float a_step = a_global[table_index];
       const float b_step = b_global[table_index];
-      for (int entry = threadIdx.x; entry < table_entries;
-           entry += kThreads) {
+      for (int entry = threadIdx.x; entry < table_entries; entry += kThreads) {
         const int packed_ab = entry / levels;
         const int level = entry - packed_ab * levels;
         int a_code = packed_ab & 0xf;
@@ -340,21 +336,19 @@ __global__ void cubic_w4_w8_compact_group_parallel_a8_gemv_kernel(
         if (b_code >= 8) b_code -= 16;
         const float a = __half2float(
             __float2half_rn(1.0f + static_cast<float>(a_code) * a_step));
-        const float b = __half2float(
-            __float2half_rn(static_cast<float>(b_code) * b_step));
+        const float b =
+            __half2float(__float2half_rn(static_cast<float>(b_code) * b_step));
         const float t = static_cast<float>(level) / (levels - 1);
-        const float normalized =
-            t * (a + t * (b + t * (1.0f - a - b)));
+        const float normalized = t * (a + t * (b + t * (1.0f - a - b)));
         carrier_lut[entry] =
             static_cast<int8_t>(__float2int_rn(normalized * 127.0f));
       }
       __syncthreads();
     } else if constexpr (Format == CubicMetadataFormat::Int8Int4Codebook) {
       constexpr int table_entries = 256 * levels;
-      const auto* table = static_cast<const int8_t*>(tertiary) +
-                          table_index * table_entries;
-      for (int entry = threadIdx.x; entry < table_entries;
-           entry += kThreads) {
+      const auto* table =
+          static_cast<const int8_t*>(tertiary) + table_index * table_entries;
+      for (int entry = threadIdx.x; entry < table_entries; entry += kThreads) {
         carrier_lut[entry] = table[entry];
       }
       __syncthreads();
@@ -372,9 +366,9 @@ __global__ void cubic_w4_w8_compact_group_parallel_a8_gemv_kernel(
               static_cast<float>(scale_code) * scale_global[table_index];
           packed_ab = static_cast<const uint8_t*>(secondary)[meta];
         } else {
-          cubic_load_metadata<Format>(
-              primary, secondary, tertiary, scale_global, a_global, b_global,
-              meta, table_index, weight_scale, a, b);
+          cubic_load_metadata<Format>(primary, secondary, tertiary,
+                                      scale_global, a_global, b_global, meta,
+                                      table_index, weight_scale, a, b);
           if constexpr (Format == CubicMetadataFormat::Int8Int4Codebook) {
             packed_ab = static_cast<const uint8_t*>(secondary)[meta];
           }
@@ -408,7 +402,7 @@ __global__ void cubic_w4_w8_compact_group_parallel_a8_gemv_kernel(
         for (int word_index = 0; word_index < Bits; ++word_index) {
           packed_words[word_index] =
               valid_output ? weight_words[group * words_per_group +
-                                            code_block * Bits + word_index]
+                                          code_block * Bits + word_index]
                            : 0;
         }
 #pragma unroll
@@ -451,8 +445,8 @@ __global__ void cubic_w4_w8_compact_group_parallel_a8_gemv_kernel(
             carrier_word |= (static_cast<unsigned>(carrier) & 0xff)
                             << (code_in_quad * 8);
           }
-          const int input_index = group * input_words_per_group +
-                                  code_block * 8 + quad;
+          const int input_index =
+              group * input_words_per_group + code_block * 8 + quad;
 #pragma unroll
           for (int route = 0; route < RoutesPerBlock; ++route) {
             if (valid_routes[route]) {
@@ -470,8 +464,8 @@ __global__ void cubic_w4_w8_compact_group_parallel_a8_gemv_kernel(
 #pragma unroll
     for (int route = 0; route < RoutesPerBlock; ++route) {
       for (int delta = kLanesPerOutput / 2; delta > 0; delta >>= 1) {
-        partials[route] += __shfl_down_sync(
-            mask, partials[route], delta, kLanesPerOutput);
+        partials[route] +=
+            __shfl_down_sync(mask, partials[route], delta, kLanesPerOutput);
       }
     }
     if (lane == 0 && valid_output) {
@@ -479,8 +473,8 @@ __global__ void cubic_w4_w8_compact_group_parallel_a8_gemv_kernel(
       for (int route = 0; route < RoutesPerBlock; ++route) {
         if (!valid_routes[route]) continue;
         const int token_id = token_ids_block[route];
-        float result = partials[route] * input_scale[input_rows[route]] *
-                       (1.0f / 127.0f);
+        float result =
+            partials[route] * input_scale[input_rows[route]] * (1.0f / 127.0f);
         if (multiply_routed_weight) result *= topk_weights[token_id];
         output[static_cast<int64_t>(token_id) * n + out_channel] =
             __float2bfloat16(result);
@@ -498,13 +492,12 @@ __global__ void cubic_w4_w8_compact_a8_fused_sum_kernel(
     const int8_t* __restrict__ input, const float* __restrict__ input_scale,
     const uint8_t* __restrict__ weight, const void* __restrict__ primary,
     const void* __restrict__ secondary, const void* __restrict__ tertiary,
-    const float* __restrict__ scale_global,
-    const float* __restrict__ a_global, const float* __restrict__ b_global,
-    __nv_bfloat16* __restrict__ output, const float* __restrict__ topk_weights,
-    const int* __restrict__ topk_ids, const int* __restrict__ expert_map,
-    int num_tokens, int top_k, int n, int k, int num_groups, int packed_k,
-    int group_out, int output_partition_size, int num_partitions,
-    bool multiply_routed_weight) {
+    const float* __restrict__ scale_global, const float* __restrict__ a_global,
+    const float* __restrict__ b_global, __nv_bfloat16* __restrict__ output,
+    const float* __restrict__ topk_weights, const int* __restrict__ topk_ids,
+    const int* __restrict__ expert_map, int num_tokens, int top_k, int n, int k,
+    int num_groups, int packed_k, int group_out, int output_partition_size,
+    int num_partitions, bool multiply_routed_weight) {
   constexpr int kThreads = 128;
   constexpr int kLanesPerOutput = 8;
   constexpr int outputs_per_block = kThreads / kLanesPerOutput;
@@ -538,11 +531,11 @@ __global__ void cubic_w4_w8_compact_a8_fused_sum_kernel(
         static_cast<int64_t>(expert) * n + out_channel;
     const int* weight_words =
         reinterpret_cast<const int*>(weight + expert_output * packed_k);
-    const int64_t meta_base =
-        (static_cast<int64_t>(expert) * (n / group_out) +
-         out_channel / group_out) * num_groups;
-    const int partition = min(out_channel / output_partition_size,
-                              num_partitions - 1);
+    const int64_t meta_base = (static_cast<int64_t>(expert) * (n / group_out) +
+                               out_channel / group_out) *
+                              num_groups;
+    const int partition =
+        min(out_channel / output_partition_size, num_partitions - 1);
     const int64_t table_index =
         static_cast<int64_t>(expert) * num_partitions + partition;
     float partial = 0.0f;
@@ -553,9 +546,9 @@ __global__ void cubic_w4_w8_compact_a8_fused_sum_kernel(
       float a = 0.0f;
       float b = 0.0f;
       if (valid_output) {
-        cubic_load_metadata<Format>(
-            primary, secondary, tertiary, scale_global, a_global, b_global,
-            meta, table_index, weight_scale, a, b);
+        cubic_load_metadata<Format>(primary, secondary, tertiary, scale_global,
+                                    a_global, b_global, meta, table_index,
+                                    weight_scale, a, b);
       }
       const float c = 1.0f - a - b;
 #pragma unroll
@@ -582,7 +575,7 @@ __global__ void cubic_w4_w8_compact_a8_fused_sum_kernel(
         for (int word_index = 0; word_index < Bits; ++word_index) {
           packed_words[word_index] =
               valid_output ? weight_words[group * words_per_group +
-                                            code_block * Bits + word_index]
+                                          code_block * Bits + word_index]
                            : 0;
         }
 #pragma unroll
@@ -615,8 +608,8 @@ __global__ void cubic_w4_w8_compact_a8_fused_sum_kernel(
             carrier_word |= (static_cast<unsigned>(carrier) & 0xff)
                             << (code_in_quad * 8);
           }
-          const int input_index = group * input_words_per_group +
-                                  code_block * 8 + quad;
+          const int input_index =
+              group * input_words_per_group + code_block * 8 + quad;
           dot = cubic_dp4a_w4_w8(carrier_word, input_words[input_index], dot);
         }
       }
@@ -679,10 +672,9 @@ __global__ void cubic_w4_w8_a8_gemv_kernel(
         static_cast<int64_t>(input_row) * input_words_per_row;
     const int* weight_words =
         reinterpret_cast<const int*>(weight + expert_output * packed_k);
-    const int64_t meta_base =
-        (static_cast<int64_t>(expert) * (n / group_out) +
-         out_channel / group_out) *
-        num_groups;
+    const int64_t meta_base = (static_cast<int64_t>(expert) * (n / group_out) +
+                               out_channel / group_out) *
+                              num_groups;
     float accumulator = 0.0f;
 
     for (int group = 0; group < num_groups; ++group) {
@@ -795,8 +787,7 @@ __global__ void cubic_w4_w8_a8_gemv_kernel(
 template <int Bits, int GroupSize, int ThreadsPerOutput>
 __global__ void cubic_curve2_shared_lut_a8_gemv_kernel(
     const int8_t* __restrict__ input, const float* __restrict__ input_scale,
-    const uint8_t* __restrict__ weight,
-    const uint16_t* __restrict__ metadata,
+    const uint8_t* __restrict__ weight, const uint16_t* __restrict__ metadata,
     const __half* __restrict__ curve_a, const __half* __restrict__ curve_b,
     __nv_bfloat16* __restrict__ output, const float* __restrict__ topk_weights,
     const int* __restrict__ token_ids, const int* __restrict__ expert_ids,
@@ -856,17 +847,16 @@ __global__ void cubic_curve2_shared_lut_a8_gemv_kernel(
 
     const int64_t expert_output =
         static_cast<int64_t>(expert) * n + out_channel;
-    const int* input_words = reinterpret_cast<const int*>(input) +
-                             static_cast<int64_t>(input_row) *
-                                 input_words_per_row;
+    const int* input_words =
+        reinterpret_cast<const int*>(input) +
+        static_cast<int64_t>(input_row) * input_words_per_row;
     const int* weight_words =
         reinterpret_cast<const int*>(weight + expert_output * packed_k);
     const int64_t meta_base =
         (static_cast<int64_t>(expert) * n + out_channel) * num_groups;
     float accumulator = 0.0f;
     for (int group = 0; group < num_groups; ++group) {
-      const uint16_t encoded =
-          valid_output ? metadata[meta_base + group] : 0;
+      const uint16_t encoded = valid_output ? metadata[meta_base + group] : 0;
       const int curve = encoded >> 14;
       const uint16_t scale_bits = (encoded & 0x3fffu) << 1;
       const float weight_scale = __half2float(__ushort_as_half(scale_bits));
@@ -965,10 +955,9 @@ __device__ __forceinline__ void cubic_w4_w8_compute_route_block(
                       static_cast<int64_t>(row1) * input_words_per_row;
   const int* weight_words =
       reinterpret_cast<const int*>(weight + expert_output * packed_k);
-  const int64_t meta_base =
-      (static_cast<int64_t>(expert) * (n / group_out) +
-       out_channel / group_out) *
-      num_groups;
+  const int64_t meta_base = (static_cast<int64_t>(expert) * (n / group_out) +
+                             out_channel / group_out) *
+                            num_groups;
   const float per_token_scale0 = GroupwiseScale ? 0.0f : input_scale[row0];
   const float per_token_scale1 =
       GroupwiseScale || !Pair ? 0.0f : input_scale[row1];
@@ -1157,14 +1146,13 @@ __global__ __launch_bounds__(128, 8) void cubic_w4_w8_grouped_a8_gemv_kernel(
     const int8_t* __restrict__ input, const float* __restrict__ input_scale,
     const uint8_t* __restrict__ weight, const void* __restrict__ primary,
     const void* __restrict__ secondary, const void* __restrict__ tertiary,
-    const float* __restrict__ scale_global,
-    const float* __restrict__ a_global, const float* __restrict__ b_global,
-    __nv_bfloat16* __restrict__ output, const float* __restrict__ topk_weights,
-    const int* __restrict__ token_ids, const int* __restrict__ expert_ids,
-    const int* __restrict__ num_routes_ptr, int num_valid_tokens, int n, int k,
-    int num_groups, int packed_k, int group_out, int top_k, int route_ctas,
-    int output_partition_size, int num_partitions,
-    bool multiply_routed_weight) {
+    const float* __restrict__ scale_global, const float* __restrict__ a_global,
+    const float* __restrict__ b_global, __nv_bfloat16* __restrict__ output,
+    const float* __restrict__ topk_weights, const int* __restrict__ token_ids,
+    const int* __restrict__ expert_ids, const int* __restrict__ num_routes_ptr,
+    int num_valid_tokens, int n, int k, int num_groups, int packed_k,
+    int group_out, int top_k, int route_ctas, int output_partition_size,
+    int num_partitions, bool multiply_routed_weight) {
   constexpr int routes_per_block = RoutesPerBlock;
   constexpr int kThreads = 128;
   constexpr int outputs_per_block = kThreads / ThreadsPerOutput;
@@ -1192,8 +1180,8 @@ __global__ __launch_bounds__(128, 8) void cubic_w4_w8_grouped_a8_gemv_kernel(
   const bool valid_output = out_channel < n;
   const bool share_output_lut =
       group_out >= outputs_per_block && group_out % outputs_per_block == 0;
-  const int num_route_blocks = (*num_routes_ptr + routes_per_block - 1) /
-                               routes_per_block;
+  const int num_route_blocks =
+      (*num_routes_ptr + routes_per_block - 1) / routes_per_block;
   const int input_words_per_row = k / 4;
 
   for (int route_block = blockIdx.x; route_block < num_route_blocks;
@@ -1210,9 +1198,9 @@ __global__ __launch_bounds__(128, 8) void cubic_w4_w8_grouped_a8_gemv_kernel(
       valid[route] = static_cast<unsigned>(tokens[route]) <
                      static_cast<unsigned>(num_valid_tokens);
       rows[route] = valid[route] ? tokens[route] / top_k : 0;
-      input_rows[route] = reinterpret_cast<const int*>(input) +
-                          static_cast<int64_t>(rows[route]) *
-                              input_words_per_row;
+      input_rows[route] =
+          reinterpret_cast<const int*>(input) +
+          static_cast<int64_t>(rows[route]) * input_words_per_row;
       if constexpr (!GroupwiseScale) {
         if (lane == 0) activation_scales[route] = input_scale[rows[route]];
       }
@@ -1228,10 +1216,9 @@ __global__ __launch_bounds__(128, 8) void cubic_w4_w8_grouped_a8_gemv_kernel(
         static_cast<int64_t>(expert) * n + out_channel;
     const int* weight_words =
         reinterpret_cast<const int*>(weight + expert_output * packed_k);
-    const int64_t meta_base =
-        (static_cast<int64_t>(expert) * (n / group_out) +
-         out_channel / group_out) *
-        num_groups;
+    const int64_t meta_base = (static_cast<int64_t>(expert) * (n / group_out) +
+                               out_channel / group_out) *
+                              num_groups;
     const int64_t shared_meta_base =
         (static_cast<int64_t>(expert) * (n / group_out) +
          (blockIdx.y * outputs_per_block) / group_out) *
@@ -1259,9 +1246,9 @@ __global__ __launch_bounds__(128, 8) void cubic_w4_w8_grouped_a8_gemv_kernel(
       float cubic_b = 0.0f;
       uint8_t packed_ab = 0;
       if (valid_output) {
-        cubic_load_metadata<Format>(
-            primary, secondary, tertiary, scale_global, a_global, b_global,
-            meta, table_index, weight_scale, cubic_a, cubic_b);
+        cubic_load_metadata<Format>(primary, secondary, tertiary, scale_global,
+                                    a_global, b_global, meta, table_index,
+                                    weight_scale, cubic_a, cubic_b);
         if constexpr (Format == CubicMetadataFormat::Int8Int4Codebook) {
           packed_ab = static_cast<const uint8_t*>(secondary)[meta];
         }
@@ -1316,8 +1303,7 @@ __global__ __launch_bounds__(128, 8) void cubic_w4_w8_grouped_a8_gemv_kernel(
                 static_cast<unsigned>(carrier_lut[pair & 0xf]) & 0xff;
             const unsigned high =
                 static_cast<unsigned>(carrier_lut[pair >> 4]) & 0xff;
-            carrier_pair_lut[pair] =
-                static_cast<uint16_t>(low | (high << 8));
+            carrier_pair_lut[pair] = static_cast<uint16_t>(low | (high << 8));
           }
           __syncthreads();
         }
@@ -1350,11 +1336,10 @@ __global__ __launch_bounds__(128, 8) void cubic_w4_w8_grouped_a8_gemv_kernel(
         unsigned packed_words[Bits];
         if constexpr (Bits == 4) {
           const uint4 packed =
-              valid_output
-                  ? cubic_ldcs_u32x4(reinterpret_cast<const uint4*>(
-                        weight_words + group * words_per_group +
-                        code_block * Bits))
-                  : make_uint4(0, 0, 0, 0);
+              valid_output ? cubic_ldcs_u32x4(reinterpret_cast<const uint4*>(
+                                 weight_words + group * words_per_group +
+                                 code_block * Bits))
+                           : make_uint4(0, 0, 0, 0);
           packed_words[0] = packed.x;
           packed_words[1] = packed.y;
           packed_words[2] = packed.z;
@@ -1382,10 +1367,9 @@ __global__ __launch_bounds__(128, 8) void cubic_w4_w8_grouped_a8_gemv_kernel(
 #pragma unroll
           for (int word_index = 0; word_index < Bits; ++word_index) {
             packed_words[word_index] =
-                valid_output
-                    ? __ldcs(weight_words + group * words_per_group +
-                             code_block * Bits + word_index)
-                    : 0;
+                valid_output ? __ldcs(weight_words + group * words_per_group +
+                                      code_block * Bits + word_index)
+                             : 0;
           }
         }
 #pragma unroll
@@ -1420,8 +1404,8 @@ __global__ __launch_bounds__(128, 8) void cubic_w4_w8_grouped_a8_gemv_kernel(
                 const int magnitude = abs(signed_code);
                 const float t = static_cast<float>(magnitude) / (levels - 1);
                 const float normalized =
-                    t * (cubic_a + t * (cubic_b + t *
-                        (1.0f - cubic_a - cubic_b)));
+                    t *
+                    (cubic_a + t * (cubic_b + t * (1.0f - cubic_a - cubic_b)));
                 carrier = __float2int_rn(normalized * 127.0f);
                 if (signed_code < 0) carrier = -carrier;
               } else if constexpr (use_full_signed_lut) {
@@ -1436,10 +1420,10 @@ __global__ __launch_bounds__(128, 8) void cubic_w4_w8_grouped_a8_gemv_kernel(
                                       : static_cast<int>(raw);
                 if (signed_code == -sign_bit) signed_code = 0;
                 const int magnitude = abs(signed_code);
-                carrier = carrier_lut[(share_output_lut
-                                           ? 0
-                                           : output_in_block * levels) +
-                                      magnitude];
+                carrier =
+                    carrier_lut[(share_output_lut ? 0
+                                                  : output_in_block * levels) +
+                                magnitude];
                 if (signed_code < 0) carrier = -carrier;
               }
               carrier_word |= (static_cast<unsigned>(carrier) & 0xff)
@@ -1494,8 +1478,8 @@ void launch_cubic_w4_w8_a8(const int8_t* input, const float* input_scale,
                            const int* token_ids, const int* expert_ids,
                            const int* num_routes, int n, int k, int num_groups,
                            int packed_k, int group_out, int top_k,
-                           int route_ctas,
-                           bool multiply_routed_weight, cudaStream_t stream) {
+                           int route_ctas, bool multiply_routed_weight,
+                           cudaStream_t stream) {
   constexpr int outputs_per_block = 128 / ThreadsPerOutput;
   constexpr int levels = 1 << (Bits - 1);
   constexpr int lut_entries = Bits <= 6 ? (1 << Bits) : levels;
@@ -1514,20 +1498,18 @@ void launch_cubic_w4_w8_compact_a8(
     const void* primary, const void* secondary, const void* tertiary,
     const float* scale_global, const float* a_global, const float* b_global,
     __nv_bfloat16* output, const float* topk_weights, const int* token_ids,
-    const int* expert_ids, const int* num_routes, int n, int k,
-    int num_groups, int packed_k, int group_out, int top_k, int route_ctas,
+    const int* expert_ids, const int* num_routes, int n, int k, int num_groups,
+    int packed_k, int group_out, int top_k, int route_ctas,
     int num_valid_tokens, int output_partition_size, int num_partitions,
     bool multiply_routed_weight, cudaStream_t stream) {
   constexpr int outputs_per_block = 128 / ThreadsPerOutput;
   constexpr int levels = 1 << (Bits - 1);
   constexpr int lut_entries = Bits <= 6 ? (1 << Bits) : levels;
-  constexpr int shared_bytes =
-      Format == CubicMetadataFormat::Int8Int4Codebook
-          ? 256 * levels
-          : outputs_per_block * lut_entries;
+  constexpr int shared_bytes = Format == CubicMetadataFormat::Int8Int4Codebook
+                                   ? 256 * levels
+                                   : outputs_per_block * lut_entries;
   dim3 grid((n + outputs_per_block - 1) / outputs_per_block, route_ctas);
-  cubic_w4_w8_compact_a8_gemv_kernel<Bits, GroupSize, ThreadsPerOutput,
-                                      Format>
+  cubic_w4_w8_compact_a8_gemv_kernel<Bits, GroupSize, ThreadsPerOutput, Format>
       <<<grid, 128, shared_bytes, stream>>>(
           input, input_scale, weight, primary, secondary, tertiary,
           scale_global, a_global, b_global, output, topk_weights, token_ids,
@@ -1543,10 +1525,10 @@ void launch_cubic_w4_w8_compact_group_parallel_a8(
     const void* primary, const void* secondary, const void* tertiary,
     const float* scale_global, const float* a_global, const float* b_global,
     __nv_bfloat16* output, const float* topk_weights, const int* token_ids,
-    const int* expert_ids, const int* num_routes, int n, int k,
-    int num_groups, int packed_k, int top_k, int route_ctas,
-    int num_valid_tokens, int output_partition_size, int num_partitions,
-    bool multiply_routed_weight, cudaStream_t stream) {
+    const int* expert_ids, const int* num_routes, int n, int k, int num_groups,
+    int packed_k, int top_k, int route_ctas, int num_valid_tokens,
+    int output_partition_size, int num_partitions, bool multiply_routed_weight,
+    cudaStream_t stream) {
   constexpr int outputs_per_block = 128 / 8;
   constexpr int levels = 1 << (Bits - 1);
   constexpr int lut_entries = Bits <= 6 ? (1 << Bits) : levels;
@@ -1558,13 +1540,13 @@ void launch_cubic_w4_w8_compact_group_parallel_a8(
           ? 256 * levels
           : 128 * lut_entries;
   dim3 grid((n + outputs_per_block - 1) / outputs_per_block, route_ctas);
-  cubic_w4_w8_compact_group_parallel_a8_gemv_kernel<
-      Bits, GroupSize, RoutesPerBlock, Format>
+  cubic_w4_w8_compact_group_parallel_a8_gemv_kernel<Bits, GroupSize,
+                                                    RoutesPerBlock, Format>
       <<<grid, 128, shared_bytes, stream>>>(
           input, input_scale, weight, primary, secondary, tertiary,
           scale_global, a_global, b_global, output, topk_weights, token_ids,
-          expert_ids, num_routes, n, k, num_groups, packed_k, top_k,
-          route_ctas, num_valid_tokens, output_partition_size, num_partitions,
+          expert_ids, num_routes, n, k, num_groups, packed_k, top_k, route_ctas,
+          num_valid_tokens, output_partition_size, num_partitions,
           multiply_routed_weight);
 }
 
@@ -1596,8 +1578,7 @@ void launch_cubic_w4_w8_grouped2_a8(
     __nv_bfloat16* output, const float* topk_weights, const int* token_ids,
     const int* expert_ids, const int* num_routes, int num_valid_tokens, int n,
     int k, int num_groups, int packed_k, int group_out, int top_k,
-    int route_ctas,
-    bool multiply_routed_weight, cudaStream_t stream) {
+    int route_ctas, bool multiply_routed_weight, cudaStream_t stream) {
   constexpr int outputs_per_block = 128 / ThreadsPerOutput;
   constexpr int levels = 1 << (Bits - 1);
   constexpr int lut_entries = Bits <= 6 ? (1 << Bits) : levels;
@@ -1625,8 +1606,7 @@ void launch_cubic_w4_w8_grouped_a8(
   constexpr int outputs_per_block = 128 / ThreadsPerOutput;
   constexpr int levels = 1 << (Bits - 1);
   constexpr int lut_entries = Bits <= 6 ? (1 << Bits) : levels;
-  dim3 grid(route_ctas,
-            (n + outputs_per_block - 1) / outputs_per_block);
+  dim3 grid(route_ctas, (n + outputs_per_block - 1) / outputs_per_block);
   if constexpr (Bits == 4) {
     const bool share_output_lut =
         group_out >= outputs_per_block && group_out % outputs_per_block == 0;
@@ -1636,12 +1616,12 @@ void launch_cubic_w4_w8_grouped_a8(
                                          false>
           <<<grid, 128,
              outputs_per_block * lut_entries + RoutesPerBlock * GroupSize,
-             stream>>>(
-              input, input_scale, weight, primary, secondary, tertiary,
-              scale_global, a_global, b_global, output, topk_weights, token_ids,
-              expert_ids, num_routes, num_valid_tokens, n, k, num_groups,
-              packed_k, group_out, top_k, route_ctas, output_partition_size,
-              num_partitions, multiply_routed_weight);
+             stream>>>(input, input_scale, weight, primary, secondary, tertiary,
+                       scale_global, a_global, b_global, output, topk_weights,
+                       token_ids, expert_ids, num_routes, num_valid_tokens, n,
+                       k, num_groups, packed_k, group_out, top_k, route_ctas,
+                       output_partition_size, num_partitions,
+                       multiply_routed_weight);
       return;
     }
   }
@@ -1650,36 +1630,32 @@ void launch_cubic_w4_w8_grouped_a8(
                                      false>
       <<<grid, 128,
          outputs_per_block * lut_entries + RoutesPerBlock * GroupSize,
-         stream>>>(
-          input, input_scale, weight, primary, secondary, tertiary,
-          scale_global, a_global, b_global, output, topk_weights, token_ids,
-          expert_ids, num_routes, num_valid_tokens, n, k, num_groups, packed_k,
-          group_out, top_k, route_ctas, output_partition_size, num_partitions,
-          multiply_routed_weight);
+         stream>>>(input, input_scale, weight, primary, secondary, tertiary,
+                   scale_global, a_global, b_global, output, topk_weights,
+                   token_ids, expert_ids, num_routes, num_valid_tokens, n, k,
+                   num_groups, packed_k, group_out, top_k, route_ctas,
+                   output_partition_size, num_partitions,
+                   multiply_routed_weight);
 }
-
 
 }  // namespace
 
 void cubic_w4_w8_compact_a8_gemv(
     const torch::stable::Tensor& input,
     const torch::stable::Tensor& input_scale,
-    const torch::stable::Tensor& weight,
-    const torch::stable::Tensor& primary,
+    const torch::stable::Tensor& weight, const torch::stable::Tensor& primary,
     const torch::stable::Tensor& secondary,
     const torch::stable::Tensor& tertiary,
     const torch::stable::Tensor& scale_global,
     const torch::stable::Tensor& a_global,
-    const torch::stable::Tensor& b_global,
-    torch::stable::Tensor& output, const torch::stable::Tensor& topk_weights,
+    const torch::stable::Tensor& b_global, torch::stable::Tensor& output,
+    const torch::stable::Tensor& topk_weights,
     const torch::stable::Tensor& token_ids,
     const torch::stable::Tensor& expert_ids,
     const torch::stable::Tensor& num_routes, int64_t bits, int64_t group_size,
     int64_t group_out, int64_t top_k, bool multiply_routed_weight,
-    int64_t route_ctas, int64_t num_valid_tokens,
-    int64_t output_partition_size,
-    int64_t num_partitions, int64_t metadata_format,
-    int64_t routes_per_block) {
+    int64_t route_ctas, int64_t num_valid_tokens, int64_t output_partition_size,
+    int64_t num_partitions, int64_t metadata_format, int64_t routes_per_block) {
   STD_TORCH_CHECK(input.device().is_cuda() && weight.device().is_cuda() &&
                       output.device().is_cuda(),
                   "cubic_w4_w8_compact_a8_gemv: tensors must be CUDA tensors");
@@ -1692,8 +1668,9 @@ void cubic_w4_w8_compact_a8_gemv(
   STD_TORCH_CHECK(input.is_contiguous() && input_scale.is_contiguous() &&
                       weight.is_contiguous() && primary.is_contiguous() &&
                       secondary.is_contiguous() && tertiary.is_contiguous() &&
-                      scale_global.is_contiguous() && a_global.is_contiguous() &&
-                      b_global.is_contiguous() && output.is_contiguous(),
+                      scale_global.is_contiguous() &&
+                      a_global.is_contiguous() && b_global.is_contiguous() &&
+                      output.is_contiguous(),
                   "cubic_w4_w8_compact_a8_gemv: tensors must be contiguous");
   const int n = weight.size(1);
   const int k = input.size(1);
@@ -1704,7 +1681,8 @@ void cubic_w4_w8_compact_a8_gemv(
           group_out > 0 && n % group_out == 0 && k % group_size == 0 &&
           weight.size(2) == k * bits / 8 && route_ctas > 0 &&
           output_partition_size > 0 && num_partitions > 0 &&
-          (metadata_format == 1 || metadata_format == 2 || metadata_format == 3) &&
+          (metadata_format == 1 || metadata_format == 2 ||
+           metadata_format == 3) &&
           (routes_per_block == 1 || routes_per_block == 2 ||
            routes_per_block == 4 || routes_per_block == 8),
       "cubic_w4_w8_compact_a8_gemv: unsupported shape or format");
@@ -1717,31 +1695,31 @@ void cubic_w4_w8_compact_a8_gemv(
                   "cubic_w4_w8_compact_a8_gemv: invalid input scale shape");
   const auto stream = get_current_cuda_stream(input.get_device_index());
 
-#define COMPACT_ARGS                                                          \
-  input.const_data_ptr<int8_t>(), input_scale.const_data_ptr<float>(),        \
-      weight.const_data_ptr<uint8_t>(), primary.const_data_ptr(),             \
-      secondary.const_data_ptr(), tertiary.const_data_ptr(),                  \
-      static_cast<const float*>(scale_global.const_data_ptr()),               \
-      static_cast<const float*>(a_global.const_data_ptr()),                   \
-      static_cast<const float*>(b_global.const_data_ptr()),                   \
-      reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),            \
-      topk_weights.const_data_ptr<float>(), token_ids.const_data_ptr<int>(),   \
-      expert_ids.const_data_ptr<int>(), num_routes.const_data_ptr<int>(), n,  \
-      k, groups, weight.size(2), group_out, top_k, route_ctas,                \
+#define COMPACT_ARGS                                                         \
+  input.const_data_ptr<int8_t>(), input_scale.const_data_ptr<float>(),       \
+      weight.const_data_ptr<uint8_t>(), primary.const_data_ptr(),            \
+      secondary.const_data_ptr(), tertiary.const_data_ptr(),                 \
+      static_cast<const float*>(scale_global.const_data_ptr()),              \
+      static_cast<const float*>(a_global.const_data_ptr()),                  \
+      static_cast<const float*>(b_global.const_data_ptr()),                  \
+      reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),           \
+      topk_weights.const_data_ptr<float>(), token_ids.const_data_ptr<int>(), \
+      expert_ids.const_data_ptr<int>(), num_routes.const_data_ptr<int>(), n, \
+      k, groups, weight.size(2), group_out, top_k, route_ctas,               \
       num_valid_tokens, output_partition_size, num_partitions,               \
       multiply_routed_weight, stream
-#define COMPACT_GROUPED_ARGS                                                  \
-  input.const_data_ptr<int8_t>(), input_scale.const_data_ptr<float>(),        \
-      weight.const_data_ptr<uint8_t>(), primary.const_data_ptr(),             \
-      secondary.const_data_ptr(), tertiary.const_data_ptr(),                  \
-      static_cast<const float*>(scale_global.const_data_ptr()),               \
-      static_cast<const float*>(a_global.const_data_ptr()),                   \
-      static_cast<const float*>(b_global.const_data_ptr()),                   \
-      reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),            \
-      topk_weights.const_data_ptr<float>(), token_ids.const_data_ptr<int>(),   \
-      expert_ids.const_data_ptr<int>(), num_routes.const_data_ptr<int>(),     \
-      num_valid_tokens, n, k, groups, weight.size(2), group_out, top_k,       \
-      route_ctas, output_partition_size, num_partitions,                      \
+#define COMPACT_GROUPED_ARGS                                                 \
+  input.const_data_ptr<int8_t>(), input_scale.const_data_ptr<float>(),       \
+      weight.const_data_ptr<uint8_t>(), primary.const_data_ptr(),            \
+      secondary.const_data_ptr(), tertiary.const_data_ptr(),                 \
+      static_cast<const float*>(scale_global.const_data_ptr()),              \
+      static_cast<const float*>(a_global.const_data_ptr()),                  \
+      static_cast<const float*>(b_global.const_data_ptr()),                  \
+      reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),           \
+      topk_weights.const_data_ptr<float>(), token_ids.const_data_ptr<int>(), \
+      expert_ids.const_data_ptr<int>(), num_routes.const_data_ptr<int>(),    \
+      num_valid_tokens, n, k, groups, weight.size(2), group_out, top_k,      \
+      route_ctas, output_partition_size, num_partitions,                     \
       multiply_routed_weight, stream
   const bool disable_group_parallel =
       std::getenv("VLLM_CUBIC_DISABLE_GROUP_PARALLEL") != nullptr;
@@ -1754,53 +1732,52 @@ void cubic_w4_w8_compact_a8_gemv(
   if (!disable_group_parallel && !prefer_shared_curve2 && group_out == 1 &&
       group_size < 128 &&
       (metadata_format == 1 || metadata_format == 2 || metadata_format == 3)) {
-#define LAUNCH_GROUP_PARALLEL_ROUTE(B, G, R, F)                             \
-  launch_cubic_w4_w8_compact_group_parallel_a8<B, G, R, F>(                \
-      input.const_data_ptr<int8_t>(), input_scale.const_data_ptr<float>(),  \
-      weight.const_data_ptr<uint8_t>(), primary.const_data_ptr(),           \
-      secondary.const_data_ptr(), tertiary.const_data_ptr(),                \
-      static_cast<const float*>(scale_global.const_data_ptr()),             \
-      static_cast<const float*>(a_global.const_data_ptr()),                 \
-      static_cast<const float*>(b_global.const_data_ptr()),                 \
-      reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),          \
+#define LAUNCH_GROUP_PARALLEL_ROUTE(B, G, R, F)                              \
+  launch_cubic_w4_w8_compact_group_parallel_a8<B, G, R, F>(                  \
+      input.const_data_ptr<int8_t>(), input_scale.const_data_ptr<float>(),   \
+      weight.const_data_ptr<uint8_t>(), primary.const_data_ptr(),            \
+      secondary.const_data_ptr(), tertiary.const_data_ptr(),                 \
+      static_cast<const float*>(scale_global.const_data_ptr()),              \
+      static_cast<const float*>(a_global.const_data_ptr()),                  \
+      static_cast<const float*>(b_global.const_data_ptr()),                  \
+      reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),           \
       topk_weights.const_data_ptr<float>(), token_ids.const_data_ptr<int>(), \
-      expert_ids.const_data_ptr<int>(), num_routes.const_data_ptr<int>(),   \
-      n, k, groups, weight.size(2), top_k, route_ctas, num_valid_tokens,    \
+      expert_ids.const_data_ptr<int>(), num_routes.const_data_ptr<int>(), n, \
+      k, groups, weight.size(2), top_k, route_ctas, num_valid_tokens,        \
       output_partition_size, num_partitions, multiply_routed_weight, stream)
-#define LAUNCH_GROUP_PARALLEL(B, G, F)                    \
-  do {                                                     \
-    if (routes_per_block == 8)                             \
-      LAUNCH_GROUP_PARALLEL_ROUTE(B, G, 8, F);             \
-    else if (routes_per_block == 4)                        \
-      LAUNCH_GROUP_PARALLEL_ROUTE(B, G, 4, F);             \
-    else if (routes_per_block == 2)                        \
-      LAUNCH_GROUP_PARALLEL_ROUTE(B, G, 2, F);             \
-    else                                                   \
-      LAUNCH_GROUP_PARALLEL_ROUTE(B, G, 1, F);             \
+#define LAUNCH_GROUP_PARALLEL(B, G, F)         \
+  do {                                         \
+    if (routes_per_block == 8)                 \
+      LAUNCH_GROUP_PARALLEL_ROUTE(B, G, 8, F); \
+    else if (routes_per_block == 4)            \
+      LAUNCH_GROUP_PARALLEL_ROUTE(B, G, 4, F); \
+    else if (routes_per_block == 2)            \
+      LAUNCH_GROUP_PARALLEL_ROUTE(B, G, 2, F); \
+    else                                       \
+      LAUNCH_GROUP_PARALLEL_ROUTE(B, G, 1, F); \
   } while (0)
 #define DISPATCH_GROUP_PARALLEL_BITS(B, F) \
-  do {                                         \
-    if (group_size == 32)                      \
-      LAUNCH_GROUP_PARALLEL(B, 32, F);         \
-    else if (group_size == 64)                 \
-      LAUNCH_GROUP_PARALLEL(B, 64, F);         \
-    else if (group_size == 128)                \
-      LAUNCH_GROUP_PARALLEL(B, 128, F);        \
-    else if (group_size == 256)                \
-      LAUNCH_GROUP_PARALLEL(B, 256, F);        \
-    else                                       \
-      LAUNCH_GROUP_PARALLEL(B, 512, F);        \
-    return;                                    \
+  do {                                     \
+    if (group_size == 32)                  \
+      LAUNCH_GROUP_PARALLEL(B, 32, F);     \
+    else if (group_size == 64)             \
+      LAUNCH_GROUP_PARALLEL(B, 64, F);     \
+    else if (group_size == 128)            \
+      LAUNCH_GROUP_PARALLEL(B, 128, F);    \
+    else if (group_size == 256)            \
+      LAUNCH_GROUP_PARALLEL(B, 256, F);    \
+    else                                   \
+      LAUNCH_GROUP_PARALLEL(B, 512, F);    \
+    return;                                \
   } while (0)
-#define DISPATCH_GROUP_PARALLEL_FORMAT(B)                                  \
-  do {                                                                      \
-    if (metadata_format == 1)                                               \
-      DISPATCH_GROUP_PARALLEL_BITS(B, CubicMetadataFormat::Int8Int4);       \
-    else if (metadata_format == 3)                                          \
-      DISPATCH_GROUP_PARALLEL_BITS(                                         \
-          B, CubicMetadataFormat::Int8Int4Codebook);                        \
-    else                                                                    \
-      DISPATCH_GROUP_PARALLEL_BITS(B, CubicMetadataFormat::E5M9Curve2);     \
+#define DISPATCH_GROUP_PARALLEL_FORMAT(B)                                     \
+  do {                                                                        \
+    if (metadata_format == 1)                                                 \
+      DISPATCH_GROUP_PARALLEL_BITS(B, CubicMetadataFormat::Int8Int4);         \
+    else if (metadata_format == 3)                                            \
+      DISPATCH_GROUP_PARALLEL_BITS(B, CubicMetadataFormat::Int8Int4Codebook); \
+    else                                                                      \
+      DISPATCH_GROUP_PARALLEL_BITS(B, CubicMetadataFormat::E5M9Curve2);       \
   } while (0)
     if (bits == 4)
       DISPATCH_GROUP_PARALLEL_FORMAT(4);
@@ -1818,24 +1795,20 @@ void cubic_w4_w8_compact_a8_gemv(
 #undef LAUNCH_GROUP_PARALLEL_ROUTE
   }
   if (metadata_format == 2 && group_out == 1 && routes_per_block == 1) {
-#define LAUNCH_SHARED_CURVE2(B, G, T)                                      \
-  do {                                                                      \
-    dim3 grid((n + (128 / T) - 1) / (128 / T), route_ctas);                \
-    cubic_curve2_shared_lut_a8_gemv_kernel<B, G, T>                         \
-        <<<grid, 128, 0, stream>>>(                                         \
-            input.const_data_ptr<int8_t>(),                                 \
-            input_scale.const_data_ptr<float>(),                            \
-            weight.const_data_ptr<uint8_t>(),                               \
-            primary.const_data_ptr<uint16_t>(),                             \
-            reinterpret_cast<const __half*>(secondary.const_data_ptr()),    \
-            reinterpret_cast<const __half*>(tertiary.const_data_ptr()),     \
-            reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),    \
-            topk_weights.const_data_ptr<float>(),                           \
-            token_ids.const_data_ptr<int>(), expert_ids.const_data_ptr<int>(), \
-            num_routes.const_data_ptr<int>(), n, k, groups, weight.size(2), \
-            top_k, route_ctas, num_valid_tokens, output_partition_size,     \
-            num_partitions, multiply_routed_weight);                        \
-    return;                                                                 \
+#define LAUNCH_SHARED_CURVE2(B, G, T)                                          \
+  do {                                                                         \
+    dim3 grid((n + (128 / T) - 1) / (128 / T), route_ctas);                    \
+    cubic_curve2_shared_lut_a8_gemv_kernel<B, G, T><<<grid, 128, 0, stream>>>( \
+        input.const_data_ptr<int8_t>(), input_scale.const_data_ptr<float>(),   \
+        weight.const_data_ptr<uint8_t>(), primary.const_data_ptr<uint16_t>(),  \
+        reinterpret_cast<const __half*>(secondary.const_data_ptr()),           \
+        reinterpret_cast<const __half*>(tertiary.const_data_ptr()),            \
+        reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),           \
+        topk_weights.const_data_ptr<float>(), token_ids.const_data_ptr<int>(), \
+        expert_ids.const_data_ptr<int>(), num_routes.const_data_ptr<int>(), n, \
+        k, groups, weight.size(2), top_k, route_ctas, num_valid_tokens,        \
+        output_partition_size, num_partitions, multiply_routed_weight);        \
+    return;                                                                    \
   } while (0)
     if (bits == 5 && group_size == 32 && output_partition_size % 128 == 0)
       LAUNCH_SHARED_CURVE2(5, 32, 1);
@@ -1849,29 +1822,28 @@ void cubic_w4_w8_compact_a8_gemv(
       LAUNCH_SHARED_CURVE2(8, 512, 8);
 #undef LAUNCH_SHARED_CURVE2
   }
-#define LAUNCH_COMPACT_FORMAT(B, G, T, F)                       \
-  do {                                                          \
-    if (routes_per_block == 8)                                  \
+#define LAUNCH_COMPACT_FORMAT(B, G, T, F)                      \
+  do {                                                         \
+    if (routes_per_block == 8)                                 \
       launch_cubic_w4_w8_grouped_a8<B, G, T, 8, false, F>(     \
-          COMPACT_GROUPED_ARGS);                                 \
-    else if (routes_per_block == 4)                             \
+          COMPACT_GROUPED_ARGS);                               \
+    else if (routes_per_block == 4)                            \
       launch_cubic_w4_w8_grouped_a8<B, G, T, 4, false, F>(     \
-          COMPACT_GROUPED_ARGS);                                 \
-    else if (routes_per_block == 2)                             \
+          COMPACT_GROUPED_ARGS);                               \
+    else if (routes_per_block == 2)                            \
       launch_cubic_w4_w8_grouped_a8<B, G, T, 2, false, F>(     \
-          COMPACT_GROUPED_ARGS);                                 \
-    else                                                        \
+          COMPACT_GROUPED_ARGS);                               \
+    else                                                       \
       launch_cubic_w4_w8_compact_a8<B, G, T, F>(COMPACT_ARGS); \
   } while (0)
-#define LAUNCH_COMPACT_GROUP(B, G, T)                                  \
-  do {                                                                 \
-    if (metadata_format == 1)                                          \
-      LAUNCH_COMPACT_FORMAT(B, G, T, CubicMetadataFormat::Int8Int4);   \
-    else if (metadata_format == 3)                                     \
-      LAUNCH_COMPACT_FORMAT(B, G, T,                                   \
-                            CubicMetadataFormat::Int8Int4Codebook);    \
-    else                                                               \
-      LAUNCH_COMPACT_FORMAT(B, G, T, CubicMetadataFormat::E5M9Curve2); \
+#define LAUNCH_COMPACT_GROUP(B, G, T)                                        \
+  do {                                                                       \
+    if (metadata_format == 1)                                                \
+      LAUNCH_COMPACT_FORMAT(B, G, T, CubicMetadataFormat::Int8Int4);         \
+    else if (metadata_format == 3)                                           \
+      LAUNCH_COMPACT_FORMAT(B, G, T, CubicMetadataFormat::Int8Int4Codebook); \
+    else                                                                     \
+      LAUNCH_COMPACT_FORMAT(B, G, T, CubicMetadataFormat::E5M9Curve2);       \
   } while (0)
 #define LAUNCH_COMPACT_BITS(B)         \
   do {                                 \
@@ -1906,22 +1878,22 @@ void cubic_w4_w8_compact_a8_gemv(
 void cubic_w4_w8_compact_a8_fused_sum(
     const torch::stable::Tensor& input,
     const torch::stable::Tensor& input_scale,
-    const torch::stable::Tensor& weight,
-    const torch::stable::Tensor& primary,
+    const torch::stable::Tensor& weight, const torch::stable::Tensor& primary,
     const torch::stable::Tensor& secondary,
     const torch::stable::Tensor& tertiary,
     const torch::stable::Tensor& scale_global,
     const torch::stable::Tensor& a_global,
-    const torch::stable::Tensor& b_global,
-    torch::stable::Tensor& output, const torch::stable::Tensor& topk_weights,
+    const torch::stable::Tensor& b_global, torch::stable::Tensor& output,
+    const torch::stable::Tensor& topk_weights,
     const torch::stable::Tensor& topk_ids,
-    const torch::stable::Tensor& expert_map, int64_t bits,
-    int64_t group_size, int64_t group_out, bool multiply_routed_weight,
+    const torch::stable::Tensor& expert_map, int64_t bits, int64_t group_size,
+    int64_t group_out, bool multiply_routed_weight,
     int64_t output_partition_size, int64_t num_partitions,
     int64_t metadata_format) {
-  STD_TORCH_CHECK(input.device().is_cuda() && weight.device().is_cuda() &&
-                      output.device().is_cuda(),
-                  "cubic_w4_w8_compact_a8_fused_sum: tensors must be CUDA tensors");
+  STD_TORCH_CHECK(
+      input.device().is_cuda() && weight.device().is_cuda() &&
+          output.device().is_cuda(),
+      "cubic_w4_w8_compact_a8_fused_sum: tensors must be CUDA tensors");
   STD_TORCH_CHECK(
       input.scalar_type() == torch::headeronly::ScalarType::Char &&
           input_scale.scalar_type() == torch::headeronly::ScalarType::Float &&
@@ -1953,9 +1925,8 @@ void cubic_w4_w8_compact_a8_fused_sum(
           input.size(0) == num_tokens * top_k &&
           input_scale.numel() == input.size(0) &&
           topk_weights.numel() == num_tokens * top_k &&
-          topk_ids.numel() == num_tokens * top_k &&
-          output_partition_size > 0 && num_partitions > 0 &&
-          (metadata_format == 1 || metadata_format == 2),
+          topk_ids.numel() == num_tokens * top_k && output_partition_size > 0 &&
+          num_partitions > 0 && (metadata_format == 1 || metadata_format == 2),
       "cubic_w4_w8_compact_a8_fused_sum: unsupported shape or format");
   const int groups = k / group_size;
   STD_TORCH_CHECK(
@@ -1964,45 +1935,45 @@ void cubic_w4_w8_compact_a8_fused_sum(
       "cubic_w4_w8_compact_a8_fused_sum: invalid primary metadata shape");
   const auto stream = get_current_cuda_stream(input.get_device_index());
 
-#define FUSED_SUM_ARGS                                                       \
-  input.const_data_ptr<int8_t>(), input_scale.const_data_ptr<float>(),       \
-      weight.const_data_ptr<uint8_t>(), primary.const_data_ptr(),            \
-      secondary.const_data_ptr(), tertiary.const_data_ptr(),                 \
-      static_cast<const float*>(scale_global.const_data_ptr()),              \
-      static_cast<const float*>(a_global.const_data_ptr()),                  \
-      static_cast<const float*>(b_global.const_data_ptr()),                  \
-      reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),           \
-      topk_weights.const_data_ptr<float>(), topk_ids.const_data_ptr<int>(),  \
+#define FUSED_SUM_ARGS                                                      \
+  input.const_data_ptr<int8_t>(), input_scale.const_data_ptr<float>(),      \
+      weight.const_data_ptr<uint8_t>(), primary.const_data_ptr(),           \
+      secondary.const_data_ptr(), tertiary.const_data_ptr(),                \
+      static_cast<const float*>(scale_global.const_data_ptr()),             \
+      static_cast<const float*>(a_global.const_data_ptr()),                 \
+      static_cast<const float*>(b_global.const_data_ptr()),                 \
+      reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),          \
+      topk_weights.const_data_ptr<float>(), topk_ids.const_data_ptr<int>(), \
       expert_map.const_data_ptr<int>(), num_tokens, top_k, n, k, groups,    \
-      weight.size(2), group_out, output_partition_size, num_partitions,      \
+      weight.size(2), group_out, output_partition_size, num_partitions,     \
       multiply_routed_weight, stream
 #define LAUNCH_FUSED_SUM_GROUP(B, G, F) \
   launch_cubic_w4_w8_compact_a8_fused_sum<B, G, F>(FUSED_SUM_ARGS)
-#define DISPATCH_FUSED_SUM_GROUP(B, F)              \
-  do {                                               \
-    if (group_size == 32)                           \
-      LAUNCH_FUSED_SUM_GROUP(B, 32, F);             \
-    else if (group_size == 64)                      \
-      LAUNCH_FUSED_SUM_GROUP(B, 64, F);             \
-    else if (group_size == 128)                     \
-      LAUNCH_FUSED_SUM_GROUP(B, 128, F);            \
-    else if (group_size == 256)                     \
-      LAUNCH_FUSED_SUM_GROUP(B, 256, F);            \
-    else                                             \
-      LAUNCH_FUSED_SUM_GROUP(B, 512, F);            \
+#define DISPATCH_FUSED_SUM_GROUP(B, F)   \
+  do {                                   \
+    if (group_size == 32)                \
+      LAUNCH_FUSED_SUM_GROUP(B, 32, F);  \
+    else if (group_size == 64)           \
+      LAUNCH_FUSED_SUM_GROUP(B, 64, F);  \
+    else if (group_size == 128)          \
+      LAUNCH_FUSED_SUM_GROUP(B, 128, F); \
+    else if (group_size == 256)          \
+      LAUNCH_FUSED_SUM_GROUP(B, 256, F); \
+    else                                 \
+      LAUNCH_FUSED_SUM_GROUP(B, 512, F); \
   } while (0)
-#define DISPATCH_FUSED_SUM_BITS(F)         \
-  do {                                     \
-    if (bits == 4)                         \
-      DISPATCH_FUSED_SUM_GROUP(4, F);      \
-    else if (bits == 5)                    \
-      DISPATCH_FUSED_SUM_GROUP(5, F);      \
-    else if (bits == 6)                    \
-      DISPATCH_FUSED_SUM_GROUP(6, F);      \
-    else if (bits == 7)                    \
-      DISPATCH_FUSED_SUM_GROUP(7, F);      \
-    else                                   \
-      DISPATCH_FUSED_SUM_GROUP(8, F);      \
+#define DISPATCH_FUSED_SUM_BITS(F)    \
+  do {                                \
+    if (bits == 4)                    \
+      DISPATCH_FUSED_SUM_GROUP(4, F); \
+    else if (bits == 5)               \
+      DISPATCH_FUSED_SUM_GROUP(5, F); \
+    else if (bits == 6)               \
+      DISPATCH_FUSED_SUM_GROUP(6, F); \
+    else if (bits == 7)               \
+      DISPATCH_FUSED_SUM_GROUP(7, F); \
+    else                              \
+      DISPATCH_FUSED_SUM_GROUP(8, F); \
   } while (0)
   if (metadata_format == 1)
     DISPATCH_FUSED_SUM_BITS(CubicMetadataFormat::Int8Int4);
@@ -2025,8 +1996,8 @@ void cubic_w4_w8_a8_gemv_impl(
     const torch::stable::Tensor& expert_ids,
     const torch::stable::Tensor& num_routes, int64_t bits, int64_t group_size,
     int64_t group_out, int64_t top_k, bool multiply_routed_weight,
-    int64_t route_ctas,
-    int64_t num_valid_tokens, int64_t routes_per_block, bool groupwise_scale) {
+    int64_t route_ctas, int64_t num_valid_tokens, int64_t routes_per_block,
+    bool groupwise_scale) {
   STD_TORCH_CHECK(input.device().is_cuda() && weight.device().is_cuda() &&
                       output.device().is_cuda(),
                   "cubic_w4_w8_a8_gemv: tensors must be CUDA tensors");
@@ -2054,9 +2025,8 @@ void cubic_w4_w8_a8_gemv_impl(
           weight.size(2) == k * bits / 8,
       "cubic_w4_w8_a8_gemv: unsupported shape, bits, or group size");
   STD_TORCH_CHECK(
-      route_ctas > 0 &&
-          (routes_per_block == 1 || routes_per_block == 2 ||
-           routes_per_block == 4 || routes_per_block == 8),
+      route_ctas > 0 && (routes_per_block == 1 || routes_per_block == 2 ||
+                         routes_per_block == 4 || routes_per_block == 8),
       "cubic_w4_w8_a8_gemv: invalid route_ctas");
   const int groups = k / group_size;
   STD_TORCH_CHECK(
@@ -2081,85 +2051,84 @@ void cubic_w4_w8_a8_gemv_impl(
       reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),            \
       topk_weights.const_data_ptr<float>(), token_ids.const_data_ptr<int>(),  \
       expert_ids.const_data_ptr<int>(), num_routes.const_data_ptr<int>(), n,  \
-      k, groups, weight.size(2), group_out, top_k, route_ctas,               \
-      multiply_routed_weight,                                                \
-      stream
+      k, groups, weight.size(2), group_out, top_k, route_ctas,                \
+      multiply_routed_weight, stream
 #define CUBIC_GROUPED_ARGS                                                    \
   input.const_data_ptr<int8_t>(), input_scale.const_data_ptr<float>(),        \
       weight.const_data_ptr<uint8_t>(), weight_scale.const_data_ptr<float>(), \
       reinterpret_cast<const __half*>(cubic_a.const_data_ptr()),              \
-      reinterpret_cast<const __half*>(cubic_b.const_data_ptr()),              \
-      nullptr, nullptr, nullptr,                                              \
+      reinterpret_cast<const __half*>(cubic_b.const_data_ptr()), nullptr,     \
+      nullptr, nullptr,                                                       \
       reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),            \
       topk_weights.const_data_ptr<float>(), token_ids.const_data_ptr<int>(),  \
       expert_ids.const_data_ptr<int>(), num_routes.const_data_ptr<int>(),     \
       num_valid_tokens, n, k, groups, weight.size(2), group_out, top_k,       \
       route_ctas, n, 1, multiply_routed_weight, stream
-#define LAUNCH_GROUP_MODE(B, G, GROUPWISE)                   \
-  do {                                                       \
-    if constexpr (G == 32) {                                \
-      STD_TORCH_CHECK(routes_per_block == 1,                 \
-                      "G32 supports singleton routes only"); \
-      launch_cubic_w4_w8_a8<B, G, 1, GROUPWISE>(CUBIC_ARGS); \
-    } else if (routes_per_block == 8) {                      \
-      if constexpr (G == 64)                                 \
-        launch_cubic_w4_w8_grouped_a8<                              \
-            B, G, 2, 8, GROUPWISE, CubicMetadataFormat::Expanded>( \
-            CUBIC_GROUPED_ARGS);                             \
-      else if constexpr (G == 128)                           \
-        launch_cubic_w4_w8_grouped_a8<                              \
-            B, G, 4, 8, GROUPWISE, CubicMetadataFormat::Expanded>( \
-            CUBIC_GROUPED_ARGS);                             \
-      else if (desired_subgroup == 4)                        \
-        launch_cubic_w4_w8_grouped_a8<                              \
-            B, G, 4, 8, GROUPWISE, CubicMetadataFormat::Expanded>( \
-            CUBIC_GROUPED_ARGS);                             \
-      else                                                   \
-        launch_cubic_w4_w8_grouped_a8<                              \
-            B, G, 8, 8, GROUPWISE, CubicMetadataFormat::Expanded>( \
-            CUBIC_GROUPED_ARGS);                             \
-    } else if (routes_per_block == 4) {                      \
-      if constexpr (G == 64)                                 \
-        launch_cubic_w4_w8_grouped_a8<                              \
-            B, G, 2, 4, GROUPWISE, CubicMetadataFormat::Expanded>( \
-            CUBIC_GROUPED_ARGS);                             \
-      else if constexpr (G == 128)                           \
-        launch_cubic_w4_w8_grouped_a8<                              \
-            B, G, 4, 4, GROUPWISE, CubicMetadataFormat::Expanded>( \
-            CUBIC_GROUPED_ARGS);                             \
-      else if (desired_subgroup == 4)                        \
-        launch_cubic_w4_w8_grouped_a8<                              \
-            B, G, 4, 4, GROUPWISE, CubicMetadataFormat::Expanded>( \
-            CUBIC_GROUPED_ARGS);                             \
-      else                                                   \
-        launch_cubic_w4_w8_grouped_a8<                              \
-            B, G, 8, 4, GROUPWISE, CubicMetadataFormat::Expanded>( \
-            CUBIC_GROUPED_ARGS);                             \
-    } else if (routes_per_block == 2) {                      \
-      if constexpr (G == 64)                                 \
-        launch_cubic_w4_w8_grouped_a8<                              \
-            B, G, 2, 2, GROUPWISE, CubicMetadataFormat::Expanded>( \
-            CUBIC_GROUPED_ARGS);                             \
-      else if constexpr (G == 128)                           \
-        launch_cubic_w4_w8_grouped_a8<                              \
-            B, G, 4, 2, GROUPWISE, CubicMetadataFormat::Expanded>( \
-            CUBIC_GROUPED_ARGS);                             \
-      else if (desired_subgroup == 4)                        \
-        launch_cubic_w4_w8_grouped_a8<                              \
-            B, G, 4, 2, GROUPWISE, CubicMetadataFormat::Expanded>( \
-            CUBIC_GROUPED_ARGS);                             \
-      else                                                   \
-        launch_cubic_w4_w8_grouped_a8<                              \
-            B, G, 8, 2, GROUPWISE, CubicMetadataFormat::Expanded>( \
-            CUBIC_GROUPED_ARGS);                             \
-    } else if constexpr (G == 64)                            \
-      launch_cubic_w4_w8_a8<B, G, 2, GROUPWISE>(CUBIC_ARGS); \
-    else if constexpr (G == 128)                             \
-      launch_cubic_w4_w8_a8<B, G, 4, GROUPWISE>(CUBIC_ARGS); \
-    else if (desired_subgroup == 4)                          \
-      launch_cubic_w4_w8_a8<B, G, 4, GROUPWISE>(CUBIC_ARGS); \
-    else                                                     \
-      launch_cubic_w4_w8_a8<B, G, 8, GROUPWISE>(CUBIC_ARGS); \
+#define LAUNCH_GROUP_MODE(B, G, GROUPWISE)                            \
+  do {                                                                \
+    if constexpr (G == 32) {                                          \
+      STD_TORCH_CHECK(routes_per_block == 1,                          \
+                      "G32 supports singleton routes only");          \
+      launch_cubic_w4_w8_a8<B, G, 1, GROUPWISE>(CUBIC_ARGS);          \
+    } else if (routes_per_block == 8) {                               \
+      if constexpr (G == 64)                                          \
+        launch_cubic_w4_w8_grouped_a8<B, G, 2, 8, GROUPWISE,          \
+                                      CubicMetadataFormat::Expanded>( \
+            CUBIC_GROUPED_ARGS);                                      \
+      else if constexpr (G == 128)                                    \
+        launch_cubic_w4_w8_grouped_a8<B, G, 4, 8, GROUPWISE,          \
+                                      CubicMetadataFormat::Expanded>( \
+            CUBIC_GROUPED_ARGS);                                      \
+      else if (desired_subgroup == 4)                                 \
+        launch_cubic_w4_w8_grouped_a8<B, G, 4, 8, GROUPWISE,          \
+                                      CubicMetadataFormat::Expanded>( \
+            CUBIC_GROUPED_ARGS);                                      \
+      else                                                            \
+        launch_cubic_w4_w8_grouped_a8<B, G, 8, 8, GROUPWISE,          \
+                                      CubicMetadataFormat::Expanded>( \
+            CUBIC_GROUPED_ARGS);                                      \
+    } else if (routes_per_block == 4) {                               \
+      if constexpr (G == 64)                                          \
+        launch_cubic_w4_w8_grouped_a8<B, G, 2, 4, GROUPWISE,          \
+                                      CubicMetadataFormat::Expanded>( \
+            CUBIC_GROUPED_ARGS);                                      \
+      else if constexpr (G == 128)                                    \
+        launch_cubic_w4_w8_grouped_a8<B, G, 4, 4, GROUPWISE,          \
+                                      CubicMetadataFormat::Expanded>( \
+            CUBIC_GROUPED_ARGS);                                      \
+      else if (desired_subgroup == 4)                                 \
+        launch_cubic_w4_w8_grouped_a8<B, G, 4, 4, GROUPWISE,          \
+                                      CubicMetadataFormat::Expanded>( \
+            CUBIC_GROUPED_ARGS);                                      \
+      else                                                            \
+        launch_cubic_w4_w8_grouped_a8<B, G, 8, 4, GROUPWISE,          \
+                                      CubicMetadataFormat::Expanded>( \
+            CUBIC_GROUPED_ARGS);                                      \
+    } else if (routes_per_block == 2) {                               \
+      if constexpr (G == 64)                                          \
+        launch_cubic_w4_w8_grouped_a8<B, G, 2, 2, GROUPWISE,          \
+                                      CubicMetadataFormat::Expanded>( \
+            CUBIC_GROUPED_ARGS);                                      \
+      else if constexpr (G == 128)                                    \
+        launch_cubic_w4_w8_grouped_a8<B, G, 4, 2, GROUPWISE,          \
+                                      CubicMetadataFormat::Expanded>( \
+            CUBIC_GROUPED_ARGS);                                      \
+      else if (desired_subgroup == 4)                                 \
+        launch_cubic_w4_w8_grouped_a8<B, G, 4, 2, GROUPWISE,          \
+                                      CubicMetadataFormat::Expanded>( \
+            CUBIC_GROUPED_ARGS);                                      \
+      else                                                            \
+        launch_cubic_w4_w8_grouped_a8<B, G, 8, 2, GROUPWISE,          \
+                                      CubicMetadataFormat::Expanded>( \
+            CUBIC_GROUPED_ARGS);                                      \
+    } else if constexpr (G == 64)                                     \
+      launch_cubic_w4_w8_a8<B, G, 2, GROUPWISE>(CUBIC_ARGS);          \
+    else if constexpr (G == 128)                                      \
+      launch_cubic_w4_w8_a8<B, G, 4, GROUPWISE>(CUBIC_ARGS);          \
+    else if (desired_subgroup == 4)                                   \
+      launch_cubic_w4_w8_a8<B, G, 4, GROUPWISE>(CUBIC_ARGS);          \
+    else                                                              \
+      launch_cubic_w4_w8_a8<B, G, 8, GROUPWISE>(CUBIC_ARGS);          \
   } while (0)
 #define LAUNCH_GROUP(B, G)            \
   do {                                \
@@ -2198,7 +2167,6 @@ void cubic_w4_w8_a8_gemv_impl(
 #undef CUBIC_ARGS
 }
 
-
 void cubic_w4_w8_a8_gemv(const torch::stable::Tensor& input,
                          const torch::stable::Tensor& input_scale,
                          const torch::stable::Tensor& weight,
@@ -2231,8 +2199,7 @@ void cubic_w4_w8_groupwise_a8_gemv(
     const torch::stable::Tensor& expert_ids,
     const torch::stable::Tensor& num_routes, int64_t bits, int64_t group_size,
     int64_t group_out, int64_t top_k, bool multiply_routed_weight,
-    int64_t route_ctas,
-    int64_t num_valid_tokens, int64_t routes_per_block) {
+    int64_t route_ctas, int64_t num_valid_tokens, int64_t routes_per_block) {
   cubic_w4_w8_a8_gemv_impl(input, input_scale, weight, weight_scale, cubic_a,
                            cubic_b, output, topk_weights, token_ids, expert_ids,
                            num_routes, bits, group_size, group_out, top_k,

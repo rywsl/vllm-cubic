@@ -8,7 +8,6 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.attention.mla_attention import (
-    MLACommonBackend,
     MLACommonMetadataBuilder,
 )
 from vllm.utils.torch_utils import (
@@ -17,11 +16,16 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.kv_cache_interface import (
+    KVCacheTensor,
     KVQuantMode,
     MLAAttentionSpec,
+    compute_layer_kv_cache_shape_bytes,
+    compute_layout_strides,
+    create_kv_cache_views,
     cubic8_mla_token_size_bytes,
     get_kv_quant_mode,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 
 def test_cubic8_mla_token_layout_sizes() -> None:
@@ -43,9 +47,10 @@ def test_cubic8_mla_spec_uses_physical_byte_stride() -> None:
     )
     assert spec.kv_quant_mode == KVQuantMode.CUBIC8_GROUPWISE
     assert spec.real_page_size_bytes == 64 * 624
-    assert MLACommonBackend.get_kv_cache_shape(
-        7, 64, 1, 576, cache_dtype_str="cubic8"
-    ) == (7, 64, 624)
+    assert compute_layer_kv_cache_shape_bytes(spec, 7) == (7, 1, 64, 624)
+    assert KVQuantMode.CUBIC8_GROUPWISE == 11
+    assert KVQuantMode.TURBOQUANT_4BIT_NC == 7
+    assert KVQuantMode.NVFP4_DS_MLA == 10
 
 
 def test_cubic8_mla_group_merge_preserves_physical_layout() -> None:
@@ -108,11 +113,9 @@ def test_cubic8_mla_hybrid_page_planning_uses_packed_bytes() -> None:
         dtype=torch.uint8,
         cache_dtype_str="cubic8",
         kv_quant_mode=KVQuantMode.CUBIC8_GROUPWISE,
-        indexes_kv_by_block_stride=True,
     )
-    # A hybrid state smaller than the attention page is padded to the packed
-    # Cubic page. It must not enlarge Cubic back to the semantic 576-value
-    # layout or silently discard the per-group metadata bytes.
+    # Mixed-size groups share one backing allocation. The pool block stride
+    # must include Cubic metadata even when the recurrent state is smaller.
     mamba = MambaSpec(
         block_size=16,
         shapes=((5184,),),
@@ -120,28 +123,36 @@ def test_cubic8_mla_hybrid_page_planning_uses_packed_bytes() -> None:
     )
     vllm_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        attention_config=SimpleNamespace(hisparse_config=None),
         speculative_config=None,
         model_config=SimpleNamespace(max_model_len=1000),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         cache_config=SimpleNamespace(
             num_gpu_blocks_override=None,
             mamba_cache_mode="none",
+            prefix_cache_retention_interval=None,
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLHNC,
         ),
         kv_transfer_config=None,
     )
 
     groups = get_kv_cache_groups(vllm_config, {"mla": cubic, "mamba": mamba})
     assert len(groups) == 2
-    assert {group.kv_cache_spec.page_size_bytes for group in groups} == {16 * 624}
+    assert {group.kv_cache_spec.page_size_bytes for group in groups} == {5184, 16 * 624}
     mamba_group = next(group for group in groups if group.layer_names == ["mamba"])
-    assert mamba_group.kv_cache_spec.page_size_padded == 16 * 624
+    assert mamba_group.kv_cache_spec.page_size_bytes == 5184
 
     available_memory = 10 * 16 * 624
     config = get_kv_cache_config_from_groups(vllm_config, groups, available_memory)
     assert config.num_blocks == 10
-    assert len(config.kv_cache_tensors) == 1
-    assert config.kv_cache_tensors[0].size == available_memory
-    assert set(config.kv_cache_tensors[0].shared_by) == {"mla", "mamba"}
+    assert len(config.kv_cache_tensors) == 2
+    assert {tensor.size for tensor in config.kv_cache_tensors} == {available_memory}
+    assert {tensor.offset for tensor in config.kv_cache_tensors} == {0}
+    assert {tensor.block_stride for tensor in config.kv_cache_tensors} == {16 * 624}
+    assert {layer for tensor in config.kv_cache_tensors for layer in tensor.layers} == {
+        "mla",
+        "mamba",
+    }
 
     # Eleven shared pages hold ten 16-token MLA blocks plus the one resident
     # Mamba state page, so auto-fit must report exactly 160 tokens.
@@ -151,9 +162,8 @@ def test_cubic8_mla_hybrid_page_planning_uses_packed_bytes() -> None:
     assert vllm_config.model_config.max_model_len == 1000
 
 
-def test_cubic8_mla_padded_raw_pages_have_correct_physical_stride() -> None:
-    from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
-
+@pytest.mark.parametrize("layout", [KVCacheLayout.LBHNC, KVCacheLayout.BLHNC])
+def test_cubic8_mla_padded_raw_pages_have_correct_physical_stride(layout) -> None:
     spec = MLAAttentionSpec(
         block_size=16,
         num_kv_heads=1,
@@ -162,17 +172,18 @@ def test_cubic8_mla_padded_raw_pages_have_correct_physical_stride() -> None:
         cache_dtype_str="cubic8",
         kv_quant_mode=KVQuantMode.CUBIC8_GROUPWISE,
         page_size_padded=3 * 4096,
-        indexes_kv_by_block_stride=True,
     )
     num_blocks = 3
     raw = torch.zeros(num_blocks * spec.page_size_bytes, dtype=torch.int8)
-    view = _reshape_attention_kv_cache(
-        raw,
-        spec,
-        (num_blocks, 16, 624),
-        (0, 1, 2),
-        num_blocks,
-        None,
+    layer_stride, block_stride, *_ = compute_layout_strides(spec, num_blocks, 1, layout)
+    allocation = KVCacheTensor(
+        size=raw.numel(),
+        layers=["mla"],
+        layer_stride=layer_stride,
+        block_stride=block_stride,
+    )
+    view = create_kv_cache_views(raw, spec, num_blocks, layout, allocation)[0].squeeze(
+        1
     )
 
     assert view.shape == (num_blocks, 16, 624)
@@ -361,8 +372,10 @@ def test_fp8_q16_mla_retains_cudagraph_support() -> None:
     )
 
 
+@pytest.mark.parametrize("query_len", [1, 8])
 def test_fp8_q16_flashmla_decode_uses_native_operator(
     monkeypatch: pytest.MonkeyPatch,
+    query_len: int,
 ) -> None:
     import vllm.v1.attention.backends.mla.flashmla as flashmla
 
@@ -372,8 +385,10 @@ def test_fp8_q16_flashmla_decode_uses_native_operator(
         calls.append(kwargs)
         q = kwargs["q"]
         return (
-            torch.zeros(q.shape[0], 1, q.shape[2], 512, dtype=q.dtype),
-            torch.zeros(q.shape[0], q.shape[2], 1, dtype=torch.float32),
+            torch.zeros(q.shape[0], q.shape[1], q.shape[2], 512, dtype=q.dtype),
+            torch.arange(
+                q.shape[0] * q.shape[2] * q.shape[1], dtype=torch.float32
+            ).view(q.shape[0], q.shape[2], q.shape[1]),
         )
 
     monkeypatch.setattr(flashmla, "flash_mla_with_kvcache_fp8_q16", fake_native)
@@ -383,7 +398,8 @@ def test_fp8_q16_flashmla_decode_uses_native_operator(
     impl._native_cubic8_cache = False
     impl.kv_lora_rank = 512
     impl.scale = 576**-0.5
-    q = torch.zeros(2, 16, 576, dtype=torch.bfloat16)
+    impl.dcp_world_size = 1
+    q = torch.zeros(2 * query_len, 16, 576, dtype=torch.bfloat16)
     cache = torch.zeros(4, 64, 576, dtype=torch.float8_e4m3fn)
     scheduler = SimpleNamespace(
         tile_scheduler_metadata=torch.zeros(1, 8, dtype=torch.int32),
@@ -391,6 +407,7 @@ def test_fp8_q16_flashmla_decode_uses_native_operator(
     )
     metadata = SimpleNamespace(
         max_seq_len=128,
+        causal=True,
         decode=SimpleNamespace(
             scheduler_metadata=scheduler,
             block_table=torch.zeros(2, 2, dtype=torch.int32),
@@ -402,9 +419,57 @@ def test_fp8_q16_flashmla_decode_uses_native_operator(
     output, lse = impl._forward_fp8_q16(q, cache, metadata, layer)
 
     assert len(calls) == 1
-    assert calls[0]["q"].shape == (2, 1, 16, 576)
-    assert output.shape == (2, 16, 512)
-    assert lse.shape == (2, 16)
+    assert calls[0]["q"].shape == (2, query_len, 16, 576)
+    assert calls[0]["causal"] is True
+    assert output.shape == (2 * query_len, 16, 512)
+    expected_lse = torch.arange(2 * 16 * query_len, dtype=torch.float32)
+    expected_lse = expected_lse.view(2, 16, query_len).transpose(1, 2).reshape(-1, 16)
+    torch.testing.assert_close(lse, expected_lse)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_fp8_q16_fallback_masks_each_speculative_query(monkeypatch, causal) -> None:
+    """A rejected draft suffix must not leak into earlier verification rows."""
+    import vllm.v1.attention.backends.mla.flashmla as flashmla
+
+    query_len, batch, heads, dim = 4, 2, 2, 576
+    lengths = torch.tensor([7, 12], dtype=torch.int32)
+    tables = torch.tensor([[3], [5]], dtype=torch.int32)
+    calls = []
+
+    def decode(q, cache, values, out, lse, block_table, seq_lens, *args, **kwargs):
+        calls.append((block_table, seq_lens))
+        out.fill_(1)
+        lse.fill_(2)
+
+    monkeypatch.setattr(flashmla, "decode_attention_fwd", decode)
+    monkeypatch.setattr(flashmla, "is_workspace_manager_initialized", lambda: False)
+    monkeypatch.setattr(flashmla.envs, "VLLM_BATCH_INVARIANT", True)
+    impl = object.__new__(flashmla.FlashMLAImpl)
+    impl._fp8_cache_only = True
+    impl._cubic8_cache = impl._native_cubic8_cache = False
+    impl.dcp_world_size = 1
+    impl.kv_lora_rank = 512
+    impl.scale = dim**-0.5
+    metadata = SimpleNamespace(
+        causal=causal,
+        max_seq_len=12,
+        decode=SimpleNamespace(block_table=tables, seq_lens=lengths),
+    )
+    # FP16 deliberately exercises the Triton fallback, including its row mask.
+    output, lse = impl._forward_fp8_q16(
+        torch.zeros(batch * query_len, heads, dim, dtype=torch.float16),
+        torch.zeros(6, 64, dim, dtype=torch.float8_e4m3fn),
+        metadata,
+        SimpleNamespace(_k_scale=torch.ones(1)),
+    )
+    assert len(calls) == 1
+    table, extents = calls[0]
+    torch.testing.assert_close(table, tables.repeat_interleave(query_len, dim=0))
+    expected = [4, 5, 6, 7, 9, 10, 11, 12] if causal else [7] * 4 + [12] * 4
+    assert extents.tolist() == expected
+    assert output.shape == (batch * query_len, heads, 512)
+    assert lse.dtype == torch.float32
 
 
 def test_fp8_q16_flashmla_context_prefill_uses_native_operator(
@@ -456,10 +521,84 @@ def test_fp8_q16_flashmla_context_prefill_uses_native_operator(
     assert len(calls) == 1
     assert calls[0]["q"].shape == (1, 3, 16, 576)
     assert torch.count_nonzero(output[:2]) == 0
-    assert torch.isneginf(lse[:2]).all()
+    assert torch.isneginf(lse[:, :2]).all()
     assert torch.all(output[2:] == 1)
     assert output.shape == (5, 16, 512)
-    assert lse.shape == (5, 16)
+    assert lse.shape == (16, 5)
+
+
+@pytest.mark.parametrize("dcp_world_size", [1, 2])
+def test_k3_fp8_q16_prefix_context_uses_dcp_collective(monkeypatch, dcp_world_size):
+    """An absorbed local cache read cannot replace the DCP prefix all-gather."""
+    import vllm.models.kimi_k3.nvidia.mla as k3_mla
+
+    calls = []
+    q = torch.zeros(2, 1, 192, dtype=torch.bfloat16)
+    cache = torch.zeros(1, 64, 576, dtype=torch.float8_e4m3fn)
+    output = torch.empty(2, 128, dtype=torch.bfloat16)
+
+    def context(*args, **kwargs):
+        calls.append("parallel")
+        assert kwargs["dcp_world_size"] == 2
+        return torch.ones(2, 1, 128), torch.zeros(1, 2)
+
+    def compressed(*args):
+        calls.append("absorbed")
+        return torch.ones(2, 1, 512), torch.zeros(1, 2)
+
+    def merge(**kwargs):
+        assert kwargs["prefix_lse"].shape == (1, 2)
+        kwargs["output"].copy_(kwargs["prefix_output"])
+
+    layer = SimpleNamespace(
+        kv_cache_dtype="fp8_q16",
+        kv_cache=cache,
+        kv_b_proj=lambda x: (torch.zeros(2, 256, dtype=q.dtype), None),
+        num_local_heads=1,
+        v_head_dim=128,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        W_UK_T=torch.zeros(1, 128, 512, dtype=q.dtype),
+        _k_scale=torch.ones(1),
+        _k_scale_inv=torch.ones(1),
+        _attn_read_kv_cache=lambda: cache,
+        _v_up_proj=lambda x, out: out.fill_(1),
+        dcp_world_size=dcp_world_size,
+        impl=SimpleNamespace(
+            _context_parallel_compute_prefill_context=context,
+            _forward_fp8_q16_prefill_context=compressed,
+        ),
+    )
+    prefill = SimpleNamespace(
+        chunked_context=object(),
+        q_data_type=q.dtype,
+        prefill_backend=SimpleNamespace(
+            supports_out=lambda: False,
+            run_prefill_new_tokens=lambda **kwargs: (
+                torch.zeros(2, 1, 128),
+                torch.zeros(1, 2),
+            ),
+        ),
+    )
+    monkeypatch.setattr(k3_mla, "merge_attn_states", merge)
+    monkeypatch.setattr(
+        k3_mla,
+        "fused_mla_key_concat_kv_cache_fp8_q16_insert",
+        lambda *args: torch.zeros_like(q),
+    )
+    k3_mla.MultiHeadLatentAttention._forward_prefill_fused(
+        layer,
+        q,
+        torch.zeros(2, 512, dtype=q.dtype),
+        torch.zeros(2, 1, 64, dtype=q.dtype),
+        None,
+        None,
+        torch.arange(2),
+        SimpleNamespace(prefill=prefill),
+        output,
+    )
+    assert calls == ["parallel" if dcp_world_size == 2 else "absorbed"]
+    assert torch.all(output == 1)
 
 
 def test_cubic8_mla_decode_selector_is_shape_and_device_aware() -> None:
@@ -752,6 +891,7 @@ def test_cubic8_mla_backend_dispatch_with_locked_workspace(monkeypatch) -> None:
     query = torch.randn(batch, heads, semantic_dim, device=device, dtype=torch.bfloat16)
     metadata = SimpleNamespace(
         max_seq_len=max_seq_len,
+        causal=True,
         decode=SimpleNamespace(block_table=block_table, seq_lens=seq_lens),
     )
     layer = SimpleNamespace(_k_scale=torch.ones(1, device=device, dtype=torch.float32))

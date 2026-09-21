@@ -29,16 +29,22 @@ def _warm_eagle_bookkeeping(model_runner: "GPUModelRunner") -> None:
     if spec_config is None or not spec_config.use_eagle():
         return
 
+    from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+
+    # Only the last pipeline rank owns a drafter. Other proposer families do
+    # not use EAGLE's padded-token bookkeeping buffers.
+    drafter = getattr(model_runner, "drafter", None)
+    if not isinstance(drafter, SpecDecodeBaseProposer):
+        return
+
     device = model_runner.device
     num_spec_tokens = spec_config.num_speculative_tokens
     discard = torch.zeros(1, dtype=torch.bool, device=device)
-    backup = model_runner.drafter.backup_next_token_ids.gpu[:1]
+    backup = drafter.backup_next_token_ids.gpu[:1]
     next_tokens = torch.empty(1, dtype=torch.int32, device=device)
     valid_counts = torch.empty(1, dtype=torch.int32, device=device)
     for num_sampled_tokens in {num_spec_tokens, num_spec_tokens + 1}:
-        sampled = torch.zeros(
-            (1, num_sampled_tokens), dtype=torch.int32, device=device
-        )
+        sampled = torch.zeros((1, num_sampled_tokens), dtype=torch.int32, device=device)
         eagle_prepare_next_token_padded_kernel[(1,)](
             sampled,
             discard,
@@ -91,9 +97,7 @@ def _warm_eagle_bookkeeping(model_runner: "GPUModelRunner") -> None:
         SYNTHETIC_MODE=False,
     )
 
-    cu_num_tokens = torch.tensor(
-        [num_sampled_tokens], dtype=torch.int32, device=device
-    )
+    cu_num_tokens = torch.tensor([num_sampled_tokens], dtype=torch.int32, device=device)
     for dtype in (torch.float32, torch.int32):
         expand_batch_to_tokens(
             torch.ones(1, dtype=dtype, device=device),

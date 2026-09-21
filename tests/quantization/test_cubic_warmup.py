@@ -11,6 +11,14 @@ from vllm.model_executor.warmup import cubic_warmup
 from vllm.model_executor.warmup.cubic_warmup import _assign_cubic_tasks
 
 
+@pytest.fixture(autouse=True)
+def _cpu_policy_device_index(monkeypatch):
+    if not torch.cuda.is_available():
+        # Residency policy tests only use the index to form tactic-cache keys.
+        # Avoid initializing a CUDA device when these tests run on a CPU host.
+        monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cubic_synthetic_routes_model_router_collisions() -> None:
     layer = SimpleNamespace(top_k=8, global_num_experts=256, expert_map=None)
@@ -199,9 +207,7 @@ def test_cubic_warmup_does_not_initialize_distributed_state_without_cubic_layers
     monkeypatch,
 ):
     monkeypatch.setattr(cubic_warmup.envs, "VLLM_CUBIC_AUTOTUNE", True)
-    monkeypatch.setattr(
-        cubic_warmup, "_cubic_calibration_tasks", lambda *_, **__: ()
-    )
+    monkeypatch.setattr(cubic_warmup, "_cubic_calibration_tasks", lambda *_, **__: ())
 
     def unexpected_world_initialization():
         raise AssertionError("non-Cubic models must not initialize Cubic warmup")
@@ -329,9 +335,7 @@ def test_cubic_calibration_routes_large_bucket_only_to_moe() -> None:
     moe.cubic_intermediate_size = 2048
     moe.top_k = 6
     moe.global_num_experts = 256
-    moe.w13_weight_packed = torch.empty(
-        32, 0, 0, device="meta", dtype=torch.uint8
-    )
+    moe.w13_weight_packed = torch.empty(32, 0, 0, device="meta", dtype=torch.uint8)
     moe.w13_weight_scale = torch.empty(0, device="meta", dtype=torch.float32)
     moe.w2_weight_scale = torch.empty(0, device="meta", dtype=torch.float32)
     moe.w13_weight_a = torch.empty(0, device="meta", dtype=torch.float16)
@@ -393,9 +397,7 @@ def test_cubic_batch_validation_allows_one_ulp_reduction_drift() -> None:
     def batch_dependent_operation(x: torch.Tensor) -> torch.Tensor:
         output = x.clone()
         if x.shape[0] > 1:
-            output[0, 0] = torch.nextafter(
-                output[0, 0], torch.tensor(float("inf"))
-            )
+            output[0, 0] = torch.nextafter(output[0, 0], torch.tensor(float("inf")))
         return output
 
     cubic_warmup._validate_cubic_batch_invariance(batch_dependent_operation, inputs)
@@ -471,9 +473,9 @@ def test_a16_marlin_representation_requires_exact_stored_weight() -> None:
 def test_a16_marlin_representation_accounts_for_scale_storage_dtype() -> None:
     carrier = torch.tensor([[3]], dtype=torch.int8)
     scale = torch.tensor([[1e-6]], dtype=torch.float32)
-    fp32_scale_reconstruction = (
-        carrier.float() * scale * (1.0 / 127.0)
-    ).to(torch.bfloat16)
+    fp32_scale_reconstruction = (carrier.float() * scale * (1.0 / 127.0)).to(
+        torch.bfloat16
+    )
 
     assert not cubic_warmup._a16_marlin_representation_matches_expanded_weight(
         carrier,
@@ -605,8 +607,7 @@ def test_cubic_linear_residency_uses_partial_group_when_memory_is_tight(
 
     assert installed == [id(layer) for layer, _ in members[:4]]
     assert all(
-        layer.cubic_runtime_residency == "packed-online"
-        for layer, _ in members[4:]
+        layer.cubic_runtime_residency == "packed-online" for layer, _ in members[4:]
     )
 
 
@@ -672,9 +673,10 @@ def test_cubic_linear_residency_allocates_incremental_candidates(
 
     assert len(expanded) == 1
     assert len(carriers) == 1
-    assert {
-        layer.cubic_runtime_residency for layer, _ in members
-    } == {"expanded-metadata", "dense-expanded-replaces-packed"}
+    assert {layer.cubic_runtime_residency for layer, _ in members} == {
+        "expanded-metadata",
+        "dense-expanded-replaces-packed",
+    }
 
 
 def test_cubic_linear_residency_compares_multiple_backends(monkeypatch) -> None:
@@ -781,9 +783,7 @@ def test_cubic_linear_residency_rejects_incomplete_backend(monkeypatch) -> None:
         lambda selected, _scheme: dense.append(id(selected)),
     )
 
-    cubic_warmup._materialize_cubic_linear_residency(
-        {("layer",): [(layer, method)]}
-    )
+    cubic_warmup._materialize_cubic_linear_residency({("layer",): [(layer, method)]})
 
     assert dense == [id(layer)]
     assert layer.cubic_runtime_residency == "dense-expanded-replaces-packed"
@@ -815,9 +815,12 @@ def test_cubic_linear_residency_rejects_incomplete_exact_marlin(
             "dense",
             100,
         )
-    cubic_kernels._CUBIC_LINEAR_RESIDENCY_TACTICS[
-        key_m1 + ("exact-marlin",)
-    ] = (10.0, 1.0, "exact-marlin", 100)
+    cubic_kernels._CUBIC_LINEAR_RESIDENCY_TACTICS[key_m1 + ("exact-marlin",)] = (
+        10.0,
+        1.0,
+        "exact-marlin",
+        100,
+    )
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
@@ -837,9 +840,7 @@ def test_cubic_linear_residency_rejects_incomplete_exact_marlin(
         lambda selected, _scheme, *, token_buckets: exact.append(id(selected)),
     )
 
-    cubic_warmup._materialize_cubic_linear_residency(
-        {("layer",): [(layer, method)]}
-    )
+    cubic_warmup._materialize_cubic_linear_residency({("layer",): [(layer, method)]})
 
     assert exact == []
     assert dense == [id(layer)]
@@ -893,9 +894,7 @@ def test_cubic_linear_residency_keeps_packed_for_mixed_dense_tactics(
 
     monkeypatch.setattr(cubic_warmup, "install_cubic_a16_weight", install)
 
-    cubic_warmup._materialize_cubic_linear_residency(
-        {("layer",): [(layer, method)]}
-    )
+    cubic_warmup._materialize_cubic_linear_residency({("layer",): [(layer, method)]})
 
     assert installed == [(True, (1,))]
     assert layer.cubic_runtime_residency == "dense-expanded-with-packed-dispatch"
@@ -960,9 +959,7 @@ def test_cubic_linear_residency_combines_expanded_metadata_and_dense(
     dense_installs = []
     metadata_installs = []
 
-    def install_dense(
-        _layer, _scheme, *, retain_packed=False, online_buckets=()
-    ):
+    def install_dense(_layer, _scheme, *, retain_packed=False, online_buckets=()):
         dense_installs.append((retain_packed, online_buckets))
 
     def install_metadata(_layer, _scheme, *, token_buckets=None):
@@ -973,13 +970,8 @@ def test_cubic_linear_residency_combines_expanded_metadata_and_dense(
         cubic_warmup, "install_cubic_expanded_metadata", install_metadata
     )
 
-    cubic_warmup._materialize_cubic_linear_residency(
-        {("layer",): [(layer, method)]}
-    )
+    cubic_warmup._materialize_cubic_linear_residency({("layer",): [(layer, method)]})
 
     assert dense_installs == [(True, (1,))]
     assert metadata_installs == []
-    assert (
-        layer.cubic_runtime_residency
-        == "dense-expanded-with-packed-dispatch"
-    )
+    assert layer.cubic_runtime_residency == "dense-expanded-with-packed-dispatch"

@@ -1,5 +1,9 @@
 # Cubic checkpoint tools
 
+For the upstream-synchronized 8×H200 build, serving profiles, correctness gates,
+and reproducible Kimi-K3 latency/cache experiments, see the
+[H200 validation guide](../../docs/deployment/kimi_k3_cubic_h200.md).
+
 `quantize_k3.py` is the validated data-free Kimi K3 conversion pipeline. It
 reads the public MXFP4 checkpoint, fits the configured per-group Cubic curves,
 packs the result without intermediate model copies, writes sharded
