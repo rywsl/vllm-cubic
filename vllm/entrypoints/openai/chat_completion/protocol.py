@@ -228,6 +228,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     n: int | None = 1
     presence_penalty: float | None = 0.0
     response_format: AnyResponseFormat | None = None
+    # Kimi K3's opt-in compatibility layer accepts the vendor thinking object.
+    # It remains an untyped extension when compatibility is disabled.
+    thinking: Any = None
     seed: int | None = Field(None, ge=_INT64_MIN, le=_INT64_MAX)
     stop: StopParam = []
     stream: bool | None = False
@@ -528,6 +531,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
         - Renames the deprecated ``reasoning_content`` field to
           ``reasoning`` so downstream code only needs to check one field.
         """
+        from vllm.entrypoints.openai.chat_completion.kimi_k3_compat import (
+            normalize_kimi_k3_request,
+        )
+
+        data = normalize_kimi_k3_request(data)
+        if isinstance(data, dict):
+            from vllm.entrypoints.openai.chat_completion.kimi_k3_tools import (
+                validate_kimi_k3_tools,
+            )
+
+            data = validate_kimi_k3_tools(data)
         if not isinstance(data, dict):
             return data
         messages = data.get("messages")
@@ -570,11 +584,22 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default_template: str | None,
         default_template_content_format: ChatTemplateContentFormatOption,
     ) -> ChatParams:
+        from vllm.entrypoints.openai.chat_completion.kimi_k3_compat import (
+            kimi_k3_api_compat_enabled,
+        )
+
+        reasoning_effort = self.reasoning_effort
+        if (
+            kimi_k3_api_compat_enabled()
+            and self.thinking is not None
+            and self.thinking.get("type") == "disabled"
+        ):
+            reasoning_effort = "none"
         extra_kwargs: dict[str, Any] = dict(
             add_generation_prompt=self.add_generation_prompt,
             continue_final_message=self.continue_final_message,
             documents=self.documents,
-            reasoning_effort=self.reasoning_effort,
+            reasoning_effort=reasoning_effort,
         )
 
         # When reasoning is requested, activate thinking for models whose
@@ -585,6 +610,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.reasoning_effort is not None and "enable_thinking" not in user_kwargs:
             extra_kwargs["enable_thinking"] = self.reasoning_effort != "none"
 
+        effective_tools = self._effective_tools()
         return ChatParams(
             chat_template=self.chat_template or default_template,
             chat_template_content_format=default_template_content_format,
@@ -597,9 +623,23 @@ class ChatCompletionRequest(OpenAIBaseModel):
             # layer. Collapse that default before rendering, so K3 emits a
             # model-visible tool-choice instruction only for requests with a
             # tools block.
-            tool_choice=self.tool_choice if self.tools else None,
+            tool_choice=self.tool_choice if effective_tools else None,
             response_format=self.response_format,
         )
+
+    def _effective_tools(self):
+        """Return top-level plus validated K3 dynamic tools when enabled."""
+        from vllm.entrypoints.openai.chat_completion.kimi_k3_compat import (
+            kimi_k3_api_compat_enabled,
+        )
+
+        if not kimi_k3_api_compat_enabled():
+            return self.tools
+        from vllm.entrypoints.openai.chat_completion.kimi_k3_tools import (
+            get_effective_tools,
+        )
+
+        return get_effective_tools(self)
 
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
         if self.max_completion_tokens is not None:
@@ -903,6 +943,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if not isinstance(data, dict):
             return data
 
+        available_tools = data.get("tools")
+        from vllm.entrypoints.openai.chat_completion.kimi_k3_compat import (
+            kimi_k3_api_compat_enabled,
+        )
+
+        if kimi_k3_api_compat_enabled():
+            from vllm.entrypoints.openai.chat_completion.kimi_k3_tools import (
+                get_kimi_k3_tools,
+            )
+
+            available_tools = get_kimi_k3_tools(data)
+            if not available_tools:
+                available_tools = None
+
         # Reject empty tools array, matching OpenAI API behavior
         if data.get("tools") == []:
             raise VLLMValidationError(
@@ -913,7 +967,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
         # if "tool_choice" is not specified but tools are provided,
         # default to "auto" tool_choice
-        if "tool_choice" not in data and data.get("tools"):
+        if "tool_choice" not in data and available_tools:
             data["tool_choice"] = "auto"
 
         # if "tool_choice" is "none" -- no validation is needed for tools
@@ -923,7 +977,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
         # if "tool_choice" is specified -- validation
         if "tool_choice" in data and data["tool_choice"] is not None:
             # ensure that if "tool choice" is specified, tools are present
-            if "tools" not in data or data["tools"] is None:
+            if available_tools is None:
+                if (
+                    kimi_k3_api_compat_enabled()
+                    and data["tool_choice"] == "auto"
+                    and "tools" not in data
+                ):
+                    return data
                 raise VLLMValidationError(
                     "When using `tool_choice`, `tools` must be set.",
                     parameter="tool_choice",
@@ -969,7 +1029,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                         f" in `tool_choice`! {correct_usage_message}",
                         parameter="tool_choice.function.name",
                     )
-                for tool in data["tools"]:
+                for tool in available_tools:
                     if tool["function"]["name"] == function_name:
                         valid_tool = True
                         break
@@ -1041,6 +1101,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
                                 )
 
         return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_kimi_k3_compat_before(cls, data: Any) -> Any:
+        """Validate K3 raw extensions before other request validators run."""
+        from vllm.entrypoints.openai.chat_completion.kimi_k3_compat import (
+            normalize_kimi_k3_request,
+        )
+        from vllm.entrypoints.openai.chat_completion.kimi_k3_tools import (
+            validate_kimi_k3_tools,
+        )
+
+        data = normalize_kimi_k3_request(data)
+        return validate_kimi_k3_tools(data)
 
 
 class BatchChatCompletionRequest(OpenAIBaseModel):

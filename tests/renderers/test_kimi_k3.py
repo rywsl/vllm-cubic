@@ -309,6 +309,32 @@ def test_render_messages_derives_private_xtml_tool_attrs():
     assert tokenizer.conversations[-1] == conversation
 
 
+def test_render_messages_preserves_dynamic_system_tools_in_place(monkeypatch):
+    import vllm.envs as envs
+
+    monkeypatch.setattr(envs, "VLLM_KIMI_K3_API_COMPAT", True)
+    tokenizer = StubTokenizer([1, 2, 3])
+    renderer = _make_renderer(tokenizer)
+    dynamic_tool = {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+    conversation, _ = renderer.render_messages(
+        [
+            {"role": "system", "content": "", "tools": [dynamic_tool]},
+            {"role": "user", "content": "weather?"},
+        ],
+        ChatParams(),
+    )
+
+    assert conversation[0]["tools"] == [dynamic_tool]
+    assert tokenizer.conversations[-1][0]["tools"] == [dynamic_tool]
+
+
 def test_render_messages_ignores_client_supplied_xtml_tool_attrs():
     tokenizer = StubTokenizer([1, 2, 3])
     renderer = _make_renderer(tokenizer)

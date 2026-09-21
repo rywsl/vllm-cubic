@@ -17,6 +17,12 @@ from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
     ConversationMessage,
 )
+from vllm.entrypoints.openai.chat_completion.kimi_k3_tools import (
+    effective_tool_objects,
+)
+from vllm.entrypoints.openai.chat_completion.kimi_k3_tools import (
+    enabled as kimi_k3_api_compat_enabled,
+)
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
@@ -131,6 +137,16 @@ class OnlineRenderer:
         default_chat_template_kwargs: dict[str, Any] | None = None,
         log_error_stack: bool = False,
     ) -> None:
+        if kimi_k3_api_compat_enabled():
+            from vllm.renderers.kimi_k3 import KimiK3Renderer
+
+            if model_config.hf_config.model_type != "kimi_k3" or not isinstance(
+                renderer, KimiK3Renderer
+            ):
+                raise ValueError(
+                    "VLLM_KIMI_K3_API_COMPAT requires a Kimi K3 model "
+                    "with KimiK3Renderer."
+                )
         self.model_config = model_config
         self.renderer = renderer
         self.request_logger = request_logger
@@ -227,12 +243,13 @@ class OnlineRenderer:
                     "--tool-call-parser to be set"
                 )
 
-        if request.tools is None or (
+        effective_tools = effective_tool_objects(request)
+        if not effective_tools or (
             request.tool_choice == "none" and self.exclude_tools_when_tool_choice_none
         ):
             tool_dicts = None
         else:
-            tool_dicts = [tool.model_dump() for tool in request.tools]
+            tool_dicts = [tool.model_dump() for tool in effective_tools]
 
         if not self.use_harmony:
             # Common case.
@@ -261,7 +278,7 @@ class OnlineRenderer:
                 # TODO: Unify adjust_request() call with non-harmony branch
                 self.parser(
                     self.renderer.get_tokenizer(),
-                    request.tools,
+                    effective_tool_objects(request),
                     model_config=self.model_config,
                 ).adjust_request(request=request)
 
@@ -738,7 +755,7 @@ class OnlineRenderer:
                     raise NotImplementedError(msg)
                 request = parser(
                     tokenizer,
-                    request.tools,
+                    effective_tool_objects(request),
                     model_config=self.model_config,
                     chat_template_kwargs=chat_params.chat_template_kwargs,
                 ).adjust_request(

@@ -2075,7 +2075,7 @@ def _parse_chat_message_content(
         if "task" in message and isinstance(message["task"], str):
             result_msg["task"] = message["task"]
 
-        if role == "developer":
+        if role == "developer" or (role == "system" and envs.VLLM_KIMI_K3_API_COMPAT):
             result_msg["tools"] = message.get("tools", None)
     return result
 

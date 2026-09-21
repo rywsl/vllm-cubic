@@ -107,7 +107,9 @@ GPU memory utilization 0.95、seed 42。OOM 时先降低并发或 memory utiliza
 dSpark/RecoverSSM 预设限定 target 为 `fp8_q16`。
 
 脚本绑定 `127.0.0.1:8000`，开启供压测使用的 dev-mode cache reset/server-info
-端点。manifest 记录源码、权重和 draft revision、参数、GPU 容量与白名单环境。
+端点，并在 `KIMI_API_COMPAT=1` 时开启 Kimi Vendor Verifier 兼容校验和 K3
+严格工具调用。manifest 记录源码、权重和 draft revision、参数、GPU 容量与
+白名单环境。
 保留启动日志中的真实 KV block/容量信息；混合 MLA/SSM 的容量不能直接等同于
 `num_gpu_blocks × block_size` 个通用上下文 token。若从本地权重目录启动，
 还应保存文件校验和；revision 参数本身不能证明本地文件内容。
@@ -180,3 +182,42 @@ manifest 必须来自实际被测服务，不可拿候选版本的 manifest 代�
 至少 3 轮且全部成功。以每轮 P95 TTFT 的中位数改善且吞吐中位数不低于旧版
 90% 为性能门禁。性能通过后仍须独立通过 GPU 数值与模型质量门禁；本次交付
 不含任何已测性能提升比例，也不执行生产部署。
+
+## Kimi-Vendor-Verifier API 预检
+
+仓库外的 `Kimi-Vendor-Verifier` 固定到 `66092cf444c97356c0e11c5078c67116390615d9`
+时，使用本 checkout 的 server URL 和 `Kimi-K3-Cubic-2.5Bit` 运行四套原版
+pytest：`tests/params`、`tests/k3_features`、`tests/tool_call_json_schema`
+和 `tests/prompt_tokens`。验收入口不修改 verifier 源码、断言或官方 skip；它
+另外记录首轮失败、重试后的最终结果、跳过原因、HTTP 状态、request-id 和请求体
+哈希，Authorization 只记录为 `Bearer ***`。
+
+先在有网络的准备机执行：
+
+```bash
+.venv/bin/python tools/kimi_k3_kvv.py prepare \
+  --verifier-dir ../Kimi-Vendor-Verifier
+.venv/bin/python tools/kimi_k3_kvv.py check \
+  --verifier-dir ../Kimi-Vendor-Verifier
+```
+
+`prepare` 会检查 Git LFS 指针和固定数据哈希；prompt-token JSONL、视觉图片
+和 BEAM 资产未 hydrate 时会明确失败，不能把 pytest collection failure 当作
+模型失败。准备完成后，在 H200 服务已启动且 `KIMI_API_KEY` 已通过环境变量
+提供的机器上运行：
+
+```bash
+export KIMI_BASE_URL=http://127.0.0.1:8000/v1
+export KIMI_API_KEY=local-only-key
+export MODEL_NAME=Kimi-K3-Cubic-2.5Bit
+.venv/bin/python tools/kimi_k3_kvv.py run \
+  --verifier-dir ../Kimi-Vendor-Verifier \
+  --work-dir artifacts/kvv-cubic
+```
+
+默认使用 `THINK_MODE=opensource`、四线程和 verifier 自己声明的 rerun 规则，
+按参数、K3 feature、Tool Schema（thinking 开／关）、prompt token 顺序执行，
+并生成 JUnit、attempt、collection、trace 和 summary JSON。测试通过只代表
+这四类 API 行为在该服务上符合 verifier；它不代表 OCR/MMMU、BEAM 1M、DeepSWE
+或量化后的模型质量达到了 README 中列出的参考分数。BEAM 1M 还需要独立 judge、
+完整 1,048,576 context 和 K3 tokenizer 配置；当前 131072 preset 不覆盖它。

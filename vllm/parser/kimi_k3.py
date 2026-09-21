@@ -10,6 +10,12 @@ from vllm.entrypoints.generate.base.protocol import (
     DeltaMessage,
     FunctionCall,
 )
+from vllm.entrypoints.openai.chat_completion.kimi_k3_tools import (
+    effective_tool_objects,
+)
+from vllm.entrypoints.openai.chat_completion.kimi_k3_tools import (
+    enabled as kimi_k3_api_compat_enabled,
+)
 from vllm.parser.abstract_parser import DelegatingParser
 from vllm.reasoning.kimi_k3_reasoning_parser import KimiK3ReasoningParser
 
@@ -25,6 +31,19 @@ class KimiK3Parser(DelegatingParser):
 
     # TODO: Switch Kimi K3 to the parser engine once its XTML reasoning/tool
     # path is covered there.
+    def adjust_request(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        if not kimi_k3_api_compat_enabled() or not hasattr(request, "messages"):
+            return super().adjust_request(request)
+
+        original_tools = request.tools
+        request.tools = effective_tool_objects(request)
+        try:
+            return super().adjust_request(request)
+        finally:
+            request.tools = original_tools
+
     def _extract_tool_calls(
         self,
         content: str | None,

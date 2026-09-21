@@ -24,6 +24,7 @@ Overrides (environment variables):
   KIMI_BATCHED_TOKENS=2048        KIMI_GPU_MEMORY_UTILIZATION=0.95
   KIMI_KV_CACHE_DTYPE=fp8_q16     auto, bfloat16, fp8_q16, or cubic8
   KIMI_DYNAMIC_A8=1              KIMI_SEED=42
+  KIMI_API_COMPAT=1              Enable the K3 API contract used by KVV
   KIMI_HOST=127.0.0.1            KIMI_PORT=8000
   KIMI_MANIFEST=artifacts/kimi-k3-server.json
   KIMI_TEST_REPORT=artifacts/kimi-k3-h200-gpu-tests.xml
@@ -78,6 +79,7 @@ KIMI_BATCHED_TOKENS=${KIMI_BATCHED_TOKENS:-2048}
 KIMI_GPU_MEMORY_UTILIZATION=${KIMI_GPU_MEMORY_UTILIZATION:-0.95}
 KIMI_KV_CACHE_DTYPE=${KIMI_KV_CACHE_DTYPE:-fp8_q16}
 KIMI_DYNAMIC_A8=${KIMI_DYNAMIC_A8:-1}
+KIMI_API_COMPAT=${KIMI_API_COMPAT:-1}
 KIMI_SEED=${KIMI_SEED:-42}
 KIMI_HOST=${KIMI_HOST:-127.0.0.1}
 KIMI_PORT=${KIMI_PORT:-8000}
@@ -91,6 +93,7 @@ positive_integer KIMI_PORT "$KIMI_PORT"
 [[ "$KIMI_GPU_MEMORY_UTILIZATION" =~ ^0\.0*[1-9][0-9]*$|^1(\.0+)?$ ]] ||
     fail 'KIMI_GPU_MEMORY_UTILIZATION must be in (0, 1]'
 [[ "$KIMI_DYNAMIC_A8" =~ ^[01]$ ]] || fail 'KIMI_DYNAMIC_A8 must be 0 or 1'
+[[ "$KIMI_API_COMPAT" =~ ^[01]$ ]] || fail 'KIMI_API_COMPAT must be 0 or 1'
 [[ "$KIMI_SEED" =~ ^(0|[1-9][0-9]{0,8})$ ]] || fail 'KIMI_SEED must be nonnegative'
 [[ "$KIMI_REVISION" =~ ^[0-9a-f]{40}$ ]] || fail 'KIMI_REVISION must be a full commit SHA'
 [[ "$KIMI_TOKENIZER_REVISION" =~ ^[0-9a-f]{40}$ ]] ||
@@ -143,7 +146,8 @@ assert hasattr(torch.ops._flashmla_extension_C, "fwd_kvcache_mla_fp8_q16"), "Bui
 kimi_runner=0
 [[ "$KIMI_PROFILE" != recoverssm ]] || kimi_runner=1
 kimi_env=(VLLM_CUBIC_DYNAMIC_A8="$KIMI_DYNAMIC_A8"
-    VLLM_USE_V2_MODEL_RUNNER="$kimi_runner" VLLM_SERVER_DEV_MODE=1)
+    VLLM_USE_V2_MODEL_RUNNER="$kimi_runner" VLLM_SERVER_DEV_MODE=1
+    VLLM_KIMI_K3_API_COMPAT="$KIMI_API_COMPAT" VLLM_ENFORCE_STRICT_TOOL_CALLING=1)
 if [[ "$KIMI_COMMAND" == gpu-tests ]]; then
     run mkdir -p -- "$(dirname -- "$KIMI_TEST_REPORT")"
     run env "${kimi_env[@]}" "$KIMI_PYTHON" -m pytest -q \
@@ -169,7 +173,7 @@ kimi_serve=("$KIMI_PYTHON" -m vllm.entrypoints.cli.main serve "$KIMI_MODEL"
     --revision "$KIMI_REVISION" --tokenizer-revision "$KIMI_TOKENIZER_REVISION"
     --trust-remote-code --code-revision "$KIMI_REVISION"
     --served-model-name Kimi-K3-Cubic-2.5Bit --dtype bfloat16 --quantization cubic
-    --reasoning-parser kimi_k3
+    --reasoning-parser kimi_k3 --enable-auto-tool-choice --tool-call-parser kimi_k3
     --tensor-parallel-size 8 --enable-expert-parallel --pipeline-parallel-size 1
     --kv-cache-dtype "$KIMI_KV_CACHE_DTYPE" --attention-backend FLASHMLA
     --enable-prefix-caching
@@ -208,6 +212,7 @@ environment = {
         "CUDA_VISIBLE_DEVICES", "NCCL_ALGO", "NCCL_PROTO", "NCCL_NVLS_ENABLE",
         "NCCL_P2P_DISABLE", "NCCL_NET_GDR_LEVEL", "VLLM_BATCH_INVARIANT",
         "VLLM_USE_V2_MODEL_RUNNER", "VLLM_GDN_DECODE_KERNEL",
+        "VLLM_KIMI_K3_API_COMPAT", "VLLM_ENFORCE_STRICT_TOOL_CALLING",
     }
 }
 environment.update(value.split("=", 1) for value in sys.argv[3:separator])

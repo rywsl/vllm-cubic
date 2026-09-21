@@ -30,6 +30,9 @@ from vllm.entrypoints.generate.base.serving import (
     clamp_prompt_logprobs,
     format_token_id_placeholder,
 )
+from vllm.entrypoints.openai.chat_completion.kimi_k3_tools import (
+    effective_tool_objects,
+)
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionLogProb,
     ChatCompletionLogProbs,
@@ -269,7 +272,7 @@ class OpenAIServingChat(GenerateBaseServing):
         if self.parser_cls is not None:
             parser = self.parser_cls(
                 tokenizer,
-                request.tools,
+                effective_tool_objects(request),
                 chat_template_kwargs=chat_template_kwargs,
                 model_config=self.model_config,
             )
@@ -492,7 +495,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 parsers: list[Parser | None] = [
                     self.parser_cls(
                         tokenizer,
-                        request.tools,
+                        effective_tool_objects(request),
                         chat_template_kwargs=chat_template_kwargs,
                         model_config=self.model_config,
                     )
@@ -1024,7 +1027,7 @@ class OpenAIServingChat(GenerateBaseServing):
 
             # handle when there are tools and tool choice is auto
             elif (
-                request.tools
+                effective_tool_objects(request)
                 and (request.tool_choice == "auto" or request.tool_choice is None)
                 and self.enable_auto_tools
                 and tool_parser_cls
