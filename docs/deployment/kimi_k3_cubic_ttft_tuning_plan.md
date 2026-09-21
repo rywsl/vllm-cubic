@@ -7,16 +7,20 @@
 
 ## 先解决两个前置条件
 
-当前 launcher 默认 `max_model_len=131072`，不能测试 297K 公共前缀。先根据 tokenizer
-真实计数、chat template、私有输入和输出余量设置，例如：
+launcher 现在默认 `max_model_len=1048576`，产品验收和对外能力必须保持这个值，否则
+不能宣称支持 Kimi K3 的百万上下文。若显存调试需要先跑较小的上下文，必须显式设置
+smoke 值，并且不能把 smoke 结果写成产品能力。先根据 tokenizer 真实计数、chat
+template、私有输入和输出余量确认配置：
 
 ```bash
-KIMI_MAX_MODEL_LEN=327680 \
+KIMI_MAX_MODEL_LEN=1048576 \
   bash examples/quantization/kimi_k3_h200.sh serve baseline
 ```
 
-`327680` 只是起始值，必须由实际 token 数和模型配置上限确认；提高上下文长度会增加
-显存 profiling、KV 容量和启动风险。先用单请求确认模型能加载，再进入 64 路压测。
+模型 revision 的 `text_config.max_position_embeddings` 为 `1048576`，仍必须在服务
+manifest 中核对 resolved `max_model_len`。提高上下文长度会增加显存 profiling、KV
+容量和启动风险；先以 1M 配置完成单请求加载、1M token 边界和 CUDA 正确性，再进入
+64 路压测。`327680` 只允许作为显存调试时的中间 smoke 配置。
 
 `--prefix-cache-retention-interval` 不是时间 TTL，它的单位是 token，只对 sliding-window
 和 Mamba checkpoint 生效。K3 的本地 GPU prefix cache 仍按容量压力下的 LRU/FIFO 淘汰，
@@ -45,13 +49,14 @@ sidecar 使用，不能把开发端点直接暴露到公网。无论采用哪种
 
 ## 渐进实验顺序
 
-所有实验固定模型/code/tokenizer revision、8×H200、TP8+EP、DCP、KV dtype、GPU 显存
+所有实验固定模型/code/tokenizer revision、`max_model_len=1048576`、8×H200、TP8+EP、DCP、KV dtype、GPU 显存
 上限和 fixture hash。每个点至少 3 轮、每轮 128 请求、并发 64；预热、CUDA graph
 capture 和 Triton 编译不计入正式采样。一个阶段未通过时停止后续阶段。
 
 ### P0：确认公共前缀真的命中
 
-用同一份 297K 公共前缀 fixture，只改变末尾私有输入，先跑单请求，再跑 64 路：
+先按 `297K → 512K → 768K → 1M` 逐级验证上下文边界；每一级先跑单请求，再跑 8 路，
+最后才跑 64 路。所有 fixture 都只改变末尾私有输入，公共前缀必须保持完全一致：
 
 ```bash
 .venv/bin/python benchmarks/kimi_k3_cubic_h200.py prepare \

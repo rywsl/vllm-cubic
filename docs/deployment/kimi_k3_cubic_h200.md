@@ -100,7 +100,7 @@ KIMI_MANIFEST=artifacts/merged-baseline-server.json \
 | `dspark` | 固定 draft revision，7 speculative tokens，DCP1 |
 | `recoverssm` | dSpark + RecoverSSM + runner V2 + FP32 SSM |
 
-默认 max model length 131072、max sequences 128、batched tokens 2048、
+默认 max model length 1048576、max sequences 128、batched tokens 2048、
 GPU memory utilization 0.95、seed 42。OOM 时先降低并发或 memory utilization，
 并把相同参数应用于对照组。`KIMI_BATCHED_TOKENS` 可逐项尝试 1024/2048/4096；
 `KIMI_KV_CACHE_DTYPE` 支持 `auto`、`bfloat16`、`fp8_q16`、`cubic8`，
@@ -220,4 +220,5 @@ export MODEL_NAME=Kimi-K3-Cubic-2.5Bit
 并生成 JUnit、attempt、collection、trace 和 summary JSON。测试通过只代表
 这四类 API 行为在该服务上符合 verifier；它不代表 OCR/MMMU、BEAM 1M、DeepSWE
 或量化后的模型质量达到了 README 中列出的参考分数。BEAM 1M 还需要独立 judge、
-完整 1,048,576 context 和 K3 tokenizer 配置；当前 131072 preset 不覆盖它。
+完整 1,048,576 context 和 K3 tokenizer 配置；本 launcher 默认使用 1,048,576，
+但仍必须通过实际服务加载、边界请求和质量验收。

@@ -40,7 +40,9 @@
 
 本规范不把 KVV 通过解释为 OCR、MMMU、BEAM 1M、DeepSWE 或通用模型质量通过。
 自然停止质量、多轮、长上下文、logprob/perplexity 和中文输出必须走独立质量门禁。
-当前 launcher 的 131072 `max_model_len` 也不覆盖 BEAM 的 1048576 context。
+如果对外宣称 Kimi K3 支持百万上下文，服务必须以 `max_model_len=1048576` 启动并通过
+1M token 边界和质量验收；launcher 默认值已经设为 `1048576`，任何显式降低到
+327680 或更低的运行只能作为 smoke，不能作为产品能力证明。
 
 ## 2. 验收门禁和结论规则
 
@@ -128,7 +130,7 @@ KIMI_MANIFEST=artifacts/merged-baseline-server.json \
 ```
 
 默认固定：TP8+EP、PP1、BF16、Cubic、FlashMLA、`fp8_q16` KV、prefix caching、
-Mamba align/TRITON、chunked prefill、max model length 131072、max sequences 128、
+Mamba align/TRITON、chunked prefill、产品验收 `max_model_len=1048576`、max sequences 128、
 batched tokens 2048、GPU memory utilization 0.95、seed 42、K3 API compatibility
 和 strict tool calling。性能 benchmark 所需的 `/metrics`、`/server_info` 和
 `/reset_prefix_cache` 依赖 `VLLM_SERVER_DEV_MODE=1`。manifest 必须显示 8 张 H200、
