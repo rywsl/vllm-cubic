@@ -379,6 +379,7 @@ CUDA/PyTorch/vLLM 版本、完整 CLI（删除 secret）、环境白名单、fix
 ## 8. 关联实现和运行手册
 
 - 上游合版和 launcher 说明：[kimi_k3_cubic_h200.md](kimi_k3_cubic_h200.md)
+- 首字 TTFT 渐进调优和两小时缓存策略：[kimi_k3_cubic_ttft_tuning_plan.md](kimi_k3_cubic_ttft_tuning_plan.md)
 - KVV runner：`tools/kimi_k3_kvv.py`、`tools/kimi_k3_kvv_plugin.py`
 - K3 协议回归：`tests/entrypoints/openai/chat_completion/test_kimi_k3_protocol.py`
 - KVV runner 回归：`tests/tools/test_kimi_k3_kvv.py`
