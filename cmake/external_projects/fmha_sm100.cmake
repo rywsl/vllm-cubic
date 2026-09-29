@@ -58,16 +58,24 @@ install(DIRECTORY "${FMHA_SM100_PY_ROOT}/cute/"
   PATTERN "*.pyc" EXCLUDE
   PATTERN ".git*" EXCLUDE)
 
-install(DIRECTORY "${FMHA_SM100_PY_ROOT}/cutlass/include/"
-  DESTINATION vllm/third_party/fmha_sm100/cutlass/include
-  COMPONENT fmha_sm100
-  PATTERN "__pycache__" EXCLUDE
-  PATTERN "*.pyc" EXCLUDE
-  PATTERN ".git*" EXCLUDE)
+# MSA snapshots used for Hopper builds may omit the Blackwell-only CUTLASS
+# headers.  The Python package remains useful on SM90 without those files;
+# only install the optional directories when the snapshot actually contains
+# them so cmake --install does not fail after a successful CUDA build.
+if(EXISTS "${FMHA_SM100_PY_ROOT}/cutlass/include")
+  install(DIRECTORY "${FMHA_SM100_PY_ROOT}/cutlass/include/"
+    DESTINATION vllm/third_party/fmha_sm100/cutlass/include
+    COMPONENT fmha_sm100
+    PATTERN "__pycache__" EXCLUDE
+    PATTERN "*.pyc" EXCLUDE
+    PATTERN ".git*" EXCLUDE)
+endif()
 
-install(DIRECTORY "${FMHA_SM100_PY_ROOT}/cutlass/tools/util/include/"
-  DESTINATION vllm/third_party/fmha_sm100/cutlass/tools/util/include
-  COMPONENT fmha_sm100
-  PATTERN "__pycache__" EXCLUDE
-  PATTERN "*.pyc" EXCLUDE
-  PATTERN ".git*" EXCLUDE)
+if(EXISTS "${FMHA_SM100_PY_ROOT}/cutlass/tools/util/include")
+  install(DIRECTORY "${FMHA_SM100_PY_ROOT}/cutlass/tools/util/include/"
+    DESTINATION vllm/third_party/fmha_sm100/cutlass/tools/util/include
+    COMPONENT fmha_sm100
+    PATTERN "__pycache__" EXCLUDE
+    PATTERN "*.pyc" EXCLUDE
+    PATTERN ".git*" EXCLUDE)
+endif()

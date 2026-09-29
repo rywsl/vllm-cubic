@@ -1,5 +1,16 @@
 include(FetchContent)
 
+# DeepGEMM's pybind binding currently requires a newer host libstdc++ than
+# some CUDA 13 build images provide. Keep it an explicit opt-out so the other
+# CUDA extensions can still be built and runtime capability detection can
+# select a supported MoE backend.
+if(DEFINED ENV{VLLM_DISABLE_DEEPGEMM}
+   AND "$ENV{VLLM_DISABLE_DEEPGEMM}" STREQUAL "1")
+  message(STATUS "DeepGEMM disabled by VLLM_DISABLE_DEEPGEMM=1")
+  add_custom_target(_deep_gemm_C)
+  return()
+endif()
+
 # If DEEPGEMM_SRC_DIR is set, DeepGEMM is built from that directory
 # instead of downloading.
 # It can be set as an environment variable or passed as a cmake argument.

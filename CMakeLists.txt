@@ -648,6 +648,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     endif()
     # marlin arches for other files
     cuda_archs_loose_intersection(MARLIN_OTHER_ARCHS "7.5;8.0+PTX" "${CUDA_ARCHS}")
+    # The 8.0+PTX fallback selects unsupported Marlin sources for H200-only builds.
+    if("${CUDA_ARCHS}" STREQUAL "9.0a")
+      set(MARLIN_OTHER_ARCHS "")
+    endif()
 
     if (MARLIN_OTHER_ARCHS)
 
@@ -1362,6 +1366,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   endif()
   # moe marlin arches for other files
   cuda_archs_loose_intersection(MARLIN_MOE_OTHER_ARCHS "7.5;8.0+PTX" "${CUDA_ARCHS}")
+  if("${CUDA_ARCHS}" STREQUAL "9.0a")
+    set(MARLIN_MOE_OTHER_ARCHS "")
+  endif()
   if (MARLIN_MOE_OTHER_ARCHS)
 
     #

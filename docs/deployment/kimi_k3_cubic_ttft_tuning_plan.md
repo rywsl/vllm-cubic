@@ -5,16 +5,18 @@
 私有输入组成。调优必须逐项改变参数，每个阶段都保留完整的 cache、排队、失败和
 首字证据。
 
-源码基线已纳入上游 vLLM `0.30.0` 发布特性（tag
-`ced6857afa0ea7b2e3f0846a62e1394e90f15607`）。由于 Cubic 合版基线
+源码基线已纳入上游 vLLM `0.30.0` 发布特性（官方 tag
+`9ed533eb4adfe48aef7e569a08daeccd2a773fed`）。本地 Cubic 同步标记
+`ced6857afa0ea7b2e3f0846a62e1394e90f15607` 只包含下游 CPU 镜像 SLEEF 子模块恢复
+检查。由于 Cubic 合版基线
 `82daf9f5756e1868be0aa751afaec4726beca12a` 与该 tag 从共同基点分叉，本计划按选择性
 同步后的当前 checkout 执行，所有性能结论仍需绑定当前候选 HEAD 和完整服务 manifest。
 
 | 版本对象 | 固定值 |
 | --- | --- |
-| 官方上游 vLLM 发布版本 | `v0.30.0` (`ced6857afa0ea7b2e3f0846a62e1394e90f15607`) |
+| 官方上游 vLLM 发布版本 | `v0.30.0` (`9ed533eb4adfe48aef7e569a08daeccd2a773fed`) |
 | Cubic 合版基线 | `82daf9f5756e1868be0aa751afaec4726beca12a` |
-| 当前候选 HEAD | `ccd7c82c61599973434406b960c1ff51a9ef7f33` |
+| 当前候选 HEAD | `54fb4edda58376aa4d53a7dfc0acc6d83d70ccff` |
 
 ## 先解决两个前置条件
 

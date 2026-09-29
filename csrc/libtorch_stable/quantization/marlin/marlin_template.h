@@ -557,6 +557,11 @@ __global__ void Marlin(
   constexpr int s_sh_stage = s_tb_groups * s_sh_stride;
   int s_gl_rd_delta = s_gl_stride;
 
+  // Number of K elements processed by one threadblock tile.  The compact
+  // dynamic-A8 path uses this offset while the regular path derives the same
+  // value through its shared-memory strides.
+  constexpr int tb_k = 16 * thread_k_blocks;
+
   constexpr int tb_n_warps = thread_n_blocks / (is_a_8bit ? 2 : 4);
 
   // Zero-points sizes/strides

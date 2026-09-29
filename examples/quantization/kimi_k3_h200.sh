@@ -174,6 +174,7 @@ kimi_serve=("$KIMI_PYTHON" -m vllm.entrypoints.cli.main serve "$KIMI_MODEL"
     --trust-remote-code --code-revision "$KIMI_REVISION"
     --served-model-name Kimi-K3-Cubic-2.5Bit --dtype bfloat16 --quantization cubic
     --reasoning-parser kimi_k3 --enable-auto-tool-choice --tool-call-parser kimi_k3
+    --enable-force-include-usage
     --tensor-parallel-size 8 --enable-expert-parallel --pipeline-parallel-size 1
     --kv-cache-dtype "$KIMI_KV_CACHE_DTYPE" --attention-backend FLASHMLA
     --enable-prefix-caching

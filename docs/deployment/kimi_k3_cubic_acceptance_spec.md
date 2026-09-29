@@ -7,12 +7,14 @@
 机器和证据文件。CPU、静态检查或 `build --dry-run` 结果不能作为 H200 性能、CUDA
 数值、模型质量或在线 API 通过的替代证明。
 
-当前候选树已包含上游 vLLM `0.30.0` 发布版的特性，发布 tag 为
-`ced6857afa0ea7b2e3f0846a62e1394e90f15607`。当前 Cubic 合版基线
-`82daf9f5756e1868be0aa751afaec4726beca12a` 与该 tag 从共同基点分叉，不在同一
+当前候选树已包含上游 vLLM `0.30.0` 发布版的特性，官方发布 tag 为
+`9ed533eb4adfe48aef7e569a08daeccd2a773fed`。本地 Cubic 同步标记
+`ced6857afa0ea7b2e3f0846a62e1394e90f15607` 是在该发布提交上的下游 CPU 镜像
+SLEEF 子模块浅克隆恢复检查，不能当作官方发布 tag。当前 Cubic 合版基线
+`82daf9f5756e1868be0aa751afaec4726beca12a` 与官方 tag 从共同基点分叉，不在同一
 ancestry 路径；合版中已包含其余发布修复的等价上游提交。因此采用选择性同步：保留
-Kimi/Cubic 下游实现，并补入发布版 CPU 镜像中 Triton CPU SLEEF 子模块的浅克隆恢复
-检查；不能把当前树描述为发布 tag 的逐字节重建。
+Kimi/Cubic 下游实现，并补入发布版 CPU 镜像中的 SLEEF 恢复检查；不能把当前树描述
+为发布 tag 的逐字节重建。
 
 ## 1. 固定对象和范围
 
@@ -20,12 +22,12 @@ Kimi/Cubic 下游实现，并补入发布版 CPU 镜像中 Triton CPU SLEEF 子�
 
 | 对象 | 固定值 | 用途 |
 | --- | --- | --- |
-| 原 Cubic | `89af4f1ff792199b7c9260dd4a86feed445fd3d6` | 性能对照和回滚基线 |
-| 官方上游 vLLM 发布版本 | `v0.30.0` (`ced6857afa0ea7b2e3f0846a62e1394e90f15607`) | 发布特性基线 |
+| 官方 Cubic fallback | `QuantTrio/vllm-cubic` release `v0.26.1+cubic.20260805` | 合并版明确阻塞时的客户试运行方案 |
+| 官方上游 vLLM 发布版本 | `v0.30.0` (`9ed533eb4adfe48aef7e569a08daeccd2a773fed`) | 发布特性基线 |
 | 上游合入目标 | `82daf9f5756e1868be0aa751afaec4726beca12a` | vLLM 主分支同步边界，非 release tag |
 | 上游共同基点 | `073c510c916f385315a5366173c883781762bb9e` | 合版审计锚点 |
 | 合版父提交 | `b0cfd84b5a614ace8097756eedc8464202ab5d46` | 上游同步结果 |
-| 候选 HEAD | `ccd7c82c61599973434406b960c1ff51a9ef7f33` | v0.30.0 选择性同步后的 KVV 版本 |
+| 候选 HEAD | `54fb4edda58376aa4d53a7dfc0acc6d83d70ccff` | v0.30.0 选择性同步后的 KVV 版本 |
 | 模型 | `QuantTrio/Kimi-K3-Cubic-2.5Bit` | 目标权重 |
 | 模型/tokenizer/code revision | `f29f15dc4afd99feb3349b538bbe7ed439787853` | 服务和 fixture 必须一致 |
 | dSpark draft revision | `cf6b8244620e7ea4b0651d214f28e89eac75bed6` | 仅 dSpark/RecoverSSM 实验 |
@@ -33,8 +35,9 @@ Kimi/Cubic 下游实现，并补入发布版 CPU 镜像中 Triton CPU SLEEF 子�
 | KVV commit | `66092cf444c97356c0e11c5078c67116390615d9` | 不允许漂移 |
 
 权重、tokenizer、code 和 draft 的 revision 必须写入服务 manifest；revision 字符串
-不能替代本地文件校验和。旧版和候选版必须使用相同权重、tokenizer、GPU、运行参数和
-请求 fixture。旧版只能保留 benchmark 工具差异，并在 manifest 中记录 dirty 状态。
+不能替代本地文件校验和。fallback 和候选版必须使用相同权重、tokenizer、GPU、运行参数和
+请求 fixture。fallback 只用于合并版阻塞后的客户试运行，并在 manifest 中记录 release 和
+dirty 状态。
 
 ### 1.2 范围边界
 
@@ -114,8 +117,9 @@ collective、量化质量或模型可加载。
 
 ### 3.3 CUDA/H200 构建和数值门禁
 
-在独占的 8×H200 主机上使用当前 checkout 编译扩展，禁止用官方预编译 wheel
-替代 Cubic extension：
+在独占的 8×H200 主机上只为当前合并 checkout 编译扩展；合并版禁止用官方预编译 wheel
+替代 Cubic extension。官方 Cubic fallback 使用已核对的 release wheel，不进入合并版
+源码构建门禁：
 
 ```bash
 bash examples/quantization/kimi_k3_h200.sh build --dry-run
@@ -267,7 +271,7 @@ DCP>1 组合。候选、目标指标和最低要求如下：
 
 ### 5.3 Benchmark protocol
 
-用固定 tokenizer revision 生成一次 fixture，旧版和候选版复用同一 JSONL。建议矩阵：
+用固定 tokenizer revision 生成一次 fixture，fallback 和候选版复用同一 JSONL。建议矩阵：
 
 - 输入 2K、8K、32K、64K；输出预算 1024。
 - 并发 1、8、32、64；每个配置至少 3 轮，每轮至少 128 请求。
@@ -303,7 +307,7 @@ rate、preemption、usage、finish reason、`[DONE]` 和 request-id。缺少非�
 
 ### 5.4 Compare gate
 
-旧版和候选版分别运行后执行：
+fallback 和候选版分别运行后执行（仅在需要 fallback 对照时）：
 
 ```bash
 .venv/bin/python benchmarks/kimi_k3_cubic_h200.py compare \
@@ -374,7 +378,7 @@ CUDA/PyTorch/vLLM 版本、完整 CLI（删除 secret）、环境白名单、fix
 
 | 项目 | 状态 | 证据/限制 |
 | --- | --- | --- |
-| G0 版本和源码边界 | `PASS` | 当前 HEAD `ccd7c82c61`，固定版本表 |
+| G0 版本和源码边界 | `PASS` | 当前 HEAD `54fb4edda5`，固定版本表 |
 | G1 合版 contract/CPU/pre-commit | `PASS` | contract 31；CPU 回归 `299 passed, 1126 skipped`；无 CUDA |
 | G2 KVV prepare/check | `PASS` | verifier `66092cf`；LFS 8/8；collection 611；`/tmp/kimi-k3-kvv-prep*` |
 | G3 CUDA/H200 构建、数值、加载 | `PENDING` | 当前环境无 NVIDIA GPU/nvcc |

@@ -352,11 +352,21 @@ class DeltaMessage(OpenAIBaseModel):
     role: str | None = None
     content: str | None = None
     reasoning: str | None = None
+    # Kimi K3's vendor-compatible API names the reasoning channel
+    # ``reasoning_content``. Keep vLLM's internal ``reasoning`` field while
+    # exposing the vendor spelling only when that compatibility mode is active.
+    reasoning_content: str | None = None
     tool_calls: list[DeltaToolCall] = Field(default_factory=list)
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        if (
+            envs.VLLM_KIMI_K3_API_COMPAT
+            and data.get("reasoning") is not None
+            and data.get("reasoning_content") is None
+        ):
+            data["reasoning_content"] = data["reasoning"]
         if len(data.get("tool_calls", [])) == 0:
             data.pop("tool_calls", None)
         return data

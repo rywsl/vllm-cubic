@@ -18,6 +18,7 @@ from pydantic import (
     model_validator,
 )
 
+import vllm.envs as envs
 from vllm.config import ModelConfig
 from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
@@ -62,6 +63,10 @@ _INT64_MAX = 2**63 - 1
 class ChatMessage(OpenAIBaseModel):
     role: str
     content: str | None = None
+    # ``reasoning`` is vLLM's internal field. Kimi K3's vendor API exposes the
+    # same channel as ``reasoning_content``; the serializer below adds that
+    # spelling only when K3 compatibility mode is enabled.
+    reasoning_content: str | None = None
     refusal: str | None = None
     annotations: OpenAIAnnotation | None = None
     audio: OpenAIChatCompletionAudio | None = None
@@ -74,6 +79,12 @@ class ChatMessage(OpenAIBaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        if (
+            envs.VLLM_KIMI_K3_API_COMPAT
+            and data.get("reasoning") is not None
+            and data.get("reasoning_content") is None
+        ):
+            data["reasoning_content"] = data["reasoning"]
         if len(data.get("tool_calls", [])) == 0:
             data.pop("tool_calls", None)
         return data

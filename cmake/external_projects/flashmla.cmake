@@ -176,6 +176,23 @@ if(FLASH_MLA_ARCHS)
         ${flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4_splitkv.cu
     )
 
+    # FlashMLA ships both Hopper (SM90) and Blackwell (SM100) kernels in the
+    # same source tree.  Compiling the SM100 files with an SM90 toolchain is
+    # invalid because they reference SM100-only CUTE MMA types.  Keep the
+    # source list architecture-aware so H200 builds only compile SM90 files.
+    set(FLASHMLA_HAS_SM100 FALSE)
+    foreach(FLASHMLA_ARCH IN LISTS FLASH_MLA_ARCHS)
+        if(FLASHMLA_ARCH MATCHES "^10\\.")
+            set(FLASHMLA_HAS_SM100 TRUE)
+        endif()
+    endforeach()
+    if(NOT FLASHMLA_HAS_SM100)
+        list(FILTER FlashMLA_SOURCES EXCLUDE REGEX "/sm100/")
+        list(APPEND FlashMLA_SOURCES
+             "${CMAKE_SOURCE_DIR}/csrc/flashmla_sm100_stub.cpp")
+        message(STATUS "FlashMLA: excluding SM100 sources for ${FLASH_MLA_ARCHS}")
+    endif()
+
     set(FlashMLA_Extension_SOURCES
         ${flashmla_SOURCE_DIR}/csrc/extension/torch_api.cpp
         ${flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/pybind.cpp

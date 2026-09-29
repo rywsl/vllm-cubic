@@ -9,11 +9,11 @@ H200 吞吐与缓存收益尚未验证。** 下列配置是实验起点，不是
 
 | 项目 | 固定版本 |
 | --- | --- |
-| 原 Cubic | `89af4f1ff792199b7c9260dd4a86feed445fd3d6` |
+| 官方 Cubic fallback | `QuantTrio/vllm-cubic` release `v0.26.1+cubic.20260805` |
 | 上游合入目标 | `82daf9f5756e1868be0aa751afaec4726beca12a` |
 | 上游共同基点 | `073c510c916f385315a5366173c883781762bb9e` |
-| 本地合并分支 | `sync/upstream-20260921` |
-| 原版本备份分支 | `backup/cubic-before-upstream-20260921-89af4f1` |
+| 本地合并分支 | `feat/kimi-k3-kvv` |
+| 合版前备份分支 | `backup/our-cubic-merged-before-v0.30.0-20260929` |
 | 目标权重、tokenizer | `f29f15dc4afd99feb3349b538bbe7ed439787853` |
 | `Inferact/Kimi-K3-DSpark` | `cf6b8244620e7ea4b0651d214f28e89eac75bed6` |
 
@@ -65,7 +65,9 @@ CPU 测试不能证明 CUDA kernel 数值、TP8 collectives、量化质量或模
 ## H200 构建、正确性与启动
 
 在配有兼容 CUDA toolkit（含 nvcc）、驱动与 8 张 H200 的机器中执行。
-构建会编译当前 checkout 的扩展；不要用官方预编译 wheel 替代 Cubic 扩展。
+合并版构建会编译当前 checkout 的扩展；不要用官方预编译 wheel 替代合并版 Cubic 扩展。
+若合并版明确阻塞，客户试运行使用已发布的官方 Cubic wheel
+`v0.26.1+cubic.20260805`。
 先查看命令，再执行构建与 GPU 回归：
 
 ```bash
@@ -167,10 +169,10 @@ external cache hit rate、preemption。SSE chunk 间隔另存为 `inter_chunk_ms
 6 秒让周期统计落盘，等待时间不计入吞吐；若修改服务端统计周期也须调大等待。
 没有输出、缺 usage、缺 `[DONE]`、错误 finish 或失败请求均不允许通过比较。
 
-旧版本对照应在单独 checkout 构建原 Cubic SHA，使用相同权重、参数、GPU、
-负载与基线 runner。可把本次 launcher 和 benchmark 复制到该 checkout 作为
-测试工具；它们不改变旧版本推理代码。保留 git dirty 标记并记录仅有工具差异，
-若旧 CLI 不支持新增参数，删去该参数且在两个对照组使用相同的实际行为。
+如合并版被阻塞，fallback 与候选版使用相同权重、参数、GPU、负载与 runner 做
+最小客户 smoke；launcher 和 benchmark 只作为外部测试工具，不改变官方 release。
+保留 release 版本和工具 dirty 标记；若 release CLI 不支持新增参数，删去该参数并
+记录实际行为差异。
 manifest 必须来自实际被测服务，不可拿候选版本的 manifest 代替。
 
 ```bash
@@ -179,7 +181,7 @@ manifest 必须来自实际被测服务，不可拿候选版本的 manifest 代�
 ```
 
 比较器要求权重/tokenizer revision、GPU、请求与实际历史 hash、场景、并发一致，
-至少 3 轮且全部成功。以每轮 P95 TTFT 的中位数改善且吞吐中位数不低于旧版
+至少 3 轮且全部成功。以每轮 P95 TTFT 的中位数改善且吞吐中位数不低于 fallback
 90% 为性能门禁。性能通过后仍须独立通过 GPU 数值与模型质量门禁；本次交付
 不含任何已测性能提升比例，也不执行生产部署。
 

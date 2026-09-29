@@ -61,6 +61,34 @@ message(STATUS "vllm-flash-attn is available at ${vllm-flash-attn_SOURCE_DIR}")
 install(CODE "set(CMAKE_INSTALL_PREFIX \"\${OLD_CMAKE_INSTALL_PREFIX}\")" ALL_COMPONENTS)
 install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY TRUE)" ALL_COMPONENTS)
 
+# Some H200 deployment builds use the matching upstream vLLM wheel for the
+# auxiliary FA2/FA3 binaries while building Cubic and FlashMLA from source.
+# Copy them into this wheel so the merged environment has no runtime .pth or
+# shared site-packages dependency on the upstream environment.
+if(DEFINED ENV{VLLM_FLASH_ATTN_PREBUILT_DIR})
+  set(_FA_PREBUILT_DIR "$ENV{VLLM_FLASH_ATTN_PREBUILT_DIR}")
+  foreach(_FA_COMPONENT _vllm_fa2_C _vllm_fa3_C)
+    set(_FA_BINARY "${_FA_PREBUILT_DIR}/${_FA_COMPONENT}.abi3.so")
+    if(NOT EXISTS "${_FA_BINARY}")
+      message(FATAL_ERROR "Missing prebuilt FlashAttention binary: ${_FA_BINARY}")
+    endif()
+    install(FILES "${_FA_BINARY}"
+      DESTINATION vllm/vllm_flash_attn
+      COMPONENT ${_FA_COMPONENT})
+  endforeach()
+  # The upstream wheel also carries Python helpers used by the multimodal
+  # rotary path. Copy them with the binaries so an editable merged checkout
+  # does not depend on the upstream environment at runtime.
+  install(DIRECTORY "${_FA_PREBUILT_DIR}/layers"
+    DESTINATION vllm/vllm_flash_attn
+    COMPONENT _vllm_fa2_C
+    FILES_MATCHING PATTERN "*.py")
+  install(DIRECTORY "${_FA_PREBUILT_DIR}/ops"
+    DESTINATION vllm/vllm_flash_attn
+    COMPONENT _vllm_fa2_C
+    FILES_MATCHING PATTERN "*.py")
+endif()
+
 # Install shared Python files for both FA2 and FA3 components
 foreach(_FA_COMPONENT _vllm_fa2_C _vllm_fa3_C)
   # Ensure the vllm/vllm_flash_attn directory exists before installation
