@@ -2,10 +2,17 @@
 
 状态：`Ready for H200 acceptance`（本地源码、CPU 和离线 verifier 预检已完成；在线 KVV、CUDA/H200、性能和模型质量仍待执行）
 
-本规范用于验收 vLLM 主分支合版、Kimi Vendor Verifier（KVV）兼容改造，以及
+本规范只用于验收 Kimi K3：包括 vLLM 主分支合版、Kimi Vendor Verifier（KVV）兼容改造，以及
 `QuantTrio/Kimi-K3-Cubic-2.5Bit` 的性能优化候选。每个结论必须绑定版本、负载、
 机器和证据文件。CPU、静态检查或 `build --dry-run` 结果不能作为 H200 性能、CUDA
 数值、模型质量或在线 API 通过的替代证明。
+
+当前候选树已包含上游 vLLM `0.30.0` 发布版的特性，发布 tag 为
+`ced6857afa0ea7b2e3f0846a62e1394e90f15607`。当前 Cubic 合版基线
+`82daf9f5756e1868be0aa751afaec4726beca12a` 与该 tag 从共同基点分叉，不在同一
+ancestry 路径；合版中已包含其余发布修复的等价上游提交。因此采用选择性同步：保留
+Kimi/Cubic 下游实现，并补入发布版 CPU 镜像中 Triton CPU SLEEF 子模块的浅克隆恢复
+检查；不能把当前树描述为发布 tag 的逐字节重建。
 
 ## 1. 固定对象和范围
 

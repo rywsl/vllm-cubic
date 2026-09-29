@@ -1,9 +1,14 @@
 # Kimi K3 Cubic 首字 TTFT 调优计划
 
-目标是单机 8×H200、64 路并发下，让首个非空 reasoning 或正文的 P95 TTFT
+本计划只覆盖 Kimi K3。目标是单机 8×H200、64 路并发下，让首个非空 reasoning 或正文的 P95 TTFT
 进入 10 秒以内。典型请求由约 297K token 的稳定公共前缀和不超过 3K token 的
 私有输入组成。调优必须逐项改变参数，每个阶段都保留完整的 cache、排队、失败和
 首字证据。
+
+源码基线已纳入上游 vLLM `0.30.0` 发布特性（tag
+`ced6857afa0ea7b2e3f0846a62e1394e90f15607`）。由于 Cubic 合版基线
+`82daf9f5756e1868be0aa751afaec4726beca12a` 与该 tag 从共同基点分叉，本计划按选择性
+同步后的当前 checkout 执行，所有性能结论仍需绑定当前候选 HEAD 和完整服务 manifest。
 
 ## 先解决两个前置条件
 
