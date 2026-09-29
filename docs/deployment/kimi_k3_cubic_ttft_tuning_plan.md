@@ -14,7 +14,7 @@
 | --- | --- |
 | 官方上游 vLLM 发布版本 | `v0.30.0` (`ced6857afa0ea7b2e3f0846a62e1394e90f15607`) |
 | Cubic 合版基线 | `82daf9f5756e1868be0aa751afaec4726beca12a` |
-| 当前候选 HEAD | `5bad9f18681fcd47ec2a97bb68c3dac8d5572651` |
+| 当前候选 HEAD | `ccd7c82c61599973434406b960c1ff51a9ef7f33` |
 
 ## 先解决两个前置条件
 
