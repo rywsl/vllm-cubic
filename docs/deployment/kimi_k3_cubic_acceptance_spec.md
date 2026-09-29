@@ -21,10 +21,11 @@ Kimi/Cubic 下游实现，并补入发布版 CPU 镜像中 Triton CPU SLEEF 子�
 | 对象 | 固定值 | 用途 |
 | --- | --- | --- |
 | 原 Cubic | `89af4f1ff792199b7c9260dd4a86feed445fd3d6` | 性能对照和回滚基线 |
-| 上游合入目标 | `82daf9f5756e1868be0aa751afaec4726beca12a` | vLLM 主分支同步边界 |
+| 官方上游 vLLM 发布版本 | `v0.30.0` (`ced6857afa0ea7b2e3f0846a62e1394e90f15607`) | 发布特性基线 |
+| 上游合入目标 | `82daf9f5756e1868be0aa751afaec4726beca12a` | vLLM 主分支同步边界，非 release tag |
 | 上游共同基点 | `073c510c916f385315a5366173c883781762bb9e` | 合版审计锚点 |
 | 合版父提交 | `b0cfd84b5a614ace8097756eedc8464202ab5d46` | 上游同步结果 |
-| 候选 HEAD | `dfc3ec8808d27e413d582f1b9347740e1e4c966f` | KVV 改造后待验收版本 |
+| 候选 HEAD | `5bad9f18681fcd47ec2a97bb68c3dac8d5572651` | v0.30.0 选择性同步后的 KVV 版本 |
 | 模型 | `QuantTrio/Kimi-K3-Cubic-2.5Bit` | 目标权重 |
 | 模型/tokenizer/code revision | `f29f15dc4afd99feb3349b538bbe7ed439787853` | 服务和 fixture 必须一致 |
 | dSpark draft revision | `cf6b8244620e7ea4b0651d214f28e89eac75bed6` | 仅 dSpark/RecoverSSM 实验 |
@@ -373,7 +374,7 @@ CUDA/PyTorch/vLLM 版本、完整 CLI（删除 secret）、环境白名单、fix
 
 | 项目 | 状态 | 证据/限制 |
 | --- | --- | --- |
-| G0 版本和源码边界 | `PASS` | 当前 HEAD `dfc3ec8808`，固定版本表 |
+| G0 版本和源码边界 | `PASS` | 当前 HEAD `5bad9f1868`，固定版本表 |
 | G1 合版 contract/CPU/pre-commit | `PASS` | contract 31；CPU 回归 `299 passed, 1126 skipped`；无 CUDA |
 | G2 KVV prepare/check | `PASS` | verifier `66092cf`；LFS 8/8；collection 611；`/tmp/kimi-k3-kvv-prep*` |
 | G3 CUDA/H200 构建、数值、加载 | `PENDING` | 当前环境无 NVIDIA GPU/nvcc |

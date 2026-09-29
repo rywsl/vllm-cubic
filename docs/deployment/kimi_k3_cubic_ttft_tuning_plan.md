@@ -10,6 +10,12 @@
 `82daf9f5756e1868be0aa751afaec4726beca12a` 与该 tag 从共同基点分叉，本计划按选择性
 同步后的当前 checkout 执行，所有性能结论仍需绑定当前候选 HEAD 和完整服务 manifest。
 
+| 版本对象 | 固定值 |
+| --- | --- |
+| 官方上游 vLLM 发布版本 | `v0.30.0` (`ced6857afa0ea7b2e3f0846a62e1394e90f15607`) |
+| Cubic 合版基线 | `82daf9f5756e1868be0aa751afaec4726beca12a` |
+| 当前候选 HEAD | `5bad9f18681fcd47ec2a97bb68c3dac8d5572651` |
+
 ## 先解决两个前置条件
 
 launcher 现在默认 `max_model_len=1048576`，产品验收和对外能力必须保持这个值，否则
