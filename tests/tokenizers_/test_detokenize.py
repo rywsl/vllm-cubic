@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Generator
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -15,6 +16,7 @@ from vllm.v1.engine.detokenizer import (
     FastIncrementalDetokenizer,
     IncrementalDetokenizer,
     SlowIncrementalDetokenizer,
+    TiktokenIncrementalDetokenizer,
 )
 
 SPECIAL_TOKS_TRUTH = [
@@ -86,6 +88,53 @@ def _run_incremental_decode(
         output_text += detokenizer.get_next_output_text(finished, delta=True)
 
     return output_text, detokenizer.output_token_ids
+
+
+def test_tiktoken_incremental_decode_handles_utf8_specials_and_invalid_ids():
+    tiktoken = pytest.importorskip("tiktoken")
+    encoding = tiktoken.Encoding(
+        name="detokenizer-test",
+        pat_str=r"(?s:.*)",
+        mergeable_ranks={b"hello": 0, b" \xe4": 1, b"\xb8\x96": 2, b"!": 3},
+        special_tokens={"<|special|>": 4},
+    )
+
+    class FakeTiktokenTokenizer:
+        model = encoding
+        all_special_ids = [4]
+        added_tokens_decoder = {4: SimpleNamespace(content="<|special|>")}
+
+        def __len__(self):
+            return 5
+
+    params = SamplingParams(
+        skip_special_tokens=False,
+        spaces_between_special_tokens=True,
+    )
+    request = EngineCoreRequest(
+        request_id="tiktoken",
+        prompt_token_ids=[1],
+        mm_features=None,
+        sampling_params=params,
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+
+    detokenizer = IncrementalDetokenizer.from_new_request(
+        FakeTiktokenTokenizer(), request
+    )
+    assert isinstance(detokenizer, TiktokenIncrementalDetokenizer)
+
+    output = ""
+    for token_id in [2, 4, 4, 999]:
+        detokenizer.update([token_id], False)
+        output += detokenizer.get_next_output_text(True, delta=True)
+
+    assert output == "世<|special|> <|special|>"
+    assert detokenizer.output_token_ids == [2, 4, 4, 999]
 
 
 @pytest.fixture

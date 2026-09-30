@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import codecs
 import sys
 from abc import ABC, abstractmethod
+from typing import Any, cast
 
 import tokenizers
 import tokenizers.decoders
@@ -58,12 +60,24 @@ class IncrementalDetokenizer:
             # No tokenizer => skipping detokenization.
             return IncrementalDetokenizer()
 
+        if _is_tiktoken_tokenizer(tokenizer):
+            # TikTokenTokenizer is a Python Transformers backend, but its
+            # Encoding object exposes a native token-bytes decoder.  Use it
+            # directly instead of the quadratic Python detokenization path.
+            return TiktokenIncrementalDetokenizer(tokenizer, request)
+
         if USE_FAST_DETOKENIZER and isinstance(tokenizer, TokenizersBackend):
             # Fast tokenizer => use tokenizers library DecodeStream.
             return FastIncrementalDetokenizer(tokenizer, request)
 
         # Fall back to slow python-based incremental detokenization.
         return SlowIncrementalDetokenizer(tokenizer, request)
+
+
+def _is_tiktoken_tokenizer(tokenizer: TokenizerLike) -> bool:
+    """Return whether ``tokenizer`` exposes tiktoken's native byte decoder."""
+    model = getattr(tokenizer, "model", None)
+    return callable(getattr(model, "decode_single_token_bytes", None))
 
 
 class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
@@ -161,6 +175,89 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
             self._last_output_text_offset = length
             return self.output_text[last_offset:length]
         return ""
+
+
+class TiktokenIncrementalDetokenizer(BaseIncrementalDetokenizer):
+    """Incrementally detokenize token IDs with a tiktoken Encoding."""
+
+    def __init__(self, tokenizer: TokenizerLike, request: EngineCoreRequest):
+        super().__init__(request)
+
+        params = request.sampling_params
+        assert params is not None
+
+        self.tokenizer = tokenizer
+        self.model: Any = cast(Any, tokenizer).model
+        self.skip_special_tokens = params.skip_special_tokens
+        self.spaces_between_special_tokens = (
+            params.skip_special_tokens or params.spaces_between_special_tokens
+        )
+        self.special_ids = frozenset(tokenizer.all_special_ids)
+        self.added_tokens = {
+            token_id: getattr(token, "content", str(token))
+            for token_id, token in getattr(
+                tokenizer, "added_tokens_decoder", {}
+            ).items()
+        }
+        self._token_bytes_by_id: dict[int, bytes] = {
+            token_id: token_bytes
+            for token_bytes, token_id in getattr(
+                self.model, "_mergeable_ranks", {}
+            ).items()
+        }
+        self._token_bytes_by_id.update(
+            {
+                token_id: token_text.encode("utf-8")
+                for token_text, token_id in getattr(
+                    self.model, "_special_tokens", {}
+                ).items()
+            }
+        )
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._last_was_special = False
+
+        # Prime the UTF-8 decoder with the prompt without exposing prompt text
+        # as generated output.  This preserves characters split at the prompt
+        # boundary, which is common for byte-level tokenizers.
+        for token_id in request.prompt_token_ids or []:
+            self._decode_token(token_id)
+
+    def _token_bytes(self, token_id: int) -> bytes | None:
+        token_bytes = self._token_bytes_by_id.get(token_id)
+        if token_bytes is not None:
+            return token_bytes
+
+        # Added tokens may not be present in the Encoding's mergeable ranks.
+        # Their literal content is the correct byte sequence.
+        token = self.added_tokens.get(token_id)
+        if token is not None:
+            return token.encode("utf-8")
+
+        try:
+            return self.model.decode_single_token_bytes(token_id)
+        except (IndexError, KeyError, OverflowError, TypeError, ValueError):
+            logger.debug("Ignoring invalid tiktoken token id: %r", token_id)
+            return None
+
+    def _decode_token(self, token_id: int) -> str:
+        is_special = token_id in self.special_ids
+        if is_special and self.skip_special_tokens:
+            self._last_was_special = False
+            return ""
+
+        token_bytes = self._token_bytes(token_id)
+        if token_bytes is None:
+            self._last_was_special = False
+            return ""
+
+        if is_special and self.spaces_between_special_tokens and self._last_was_special:
+            token_bytes = b" " + token_bytes
+
+        self._last_was_special = is_special
+        return self._decoder.decode(token_bytes, final=False)
+
+    def decode_next(self, next_token_id: int) -> str:
+        return self._decode_token(next_token_id)
 
 
 class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):

@@ -1,6 +1,6 @@
 # Kimi K3 Cubic 验收 Spec
 
-状态：`Ready for H200 acceptance`（本地源码、CPU 和离线 verifier 预检已完成；在线 KVV、CUDA/H200、性能和模型质量仍待执行）
+状态：`H200 performance tuning in progress`（合版源码、CPU 和离线 verifier 预检已完成；在线 KVV 暂停，性能和模型质量仍待完成）
 
 本规范只用于验收 Kimi K3：包括 vLLM 主分支合版、Kimi Vendor Verifier（KVV）兼容改造，以及
 `QuantTrio/Kimi-K3-Cubic-2.5Bit` 的性能优化候选。每个结论必须绑定版本、负载、
@@ -51,9 +51,8 @@ dirty 状态。
 
 本规范不把 KVV 通过解释为 OCR、MMMU、BEAM 1M、DeepSWE 或通用模型质量通过。
 自然停止质量、多轮、长上下文、logprob/perplexity 和中文输出必须走独立质量门禁。
-如果对外宣称 Kimi K3 支持百万上下文，服务必须以 `max_model_len=1048576` 启动并通过
-1M token 边界和质量验收；launcher 默认值已经设为 `1048576`，任何显式降低到
-327680 或更低的运行只能作为 smoke，不能作为产品能力证明。
+当前性能阶段使用 `max_model_len=auto`，不宣称 1M 能力；后续单独切换到
+`1048576`，通过 1M token 边界和质量验收后再发布百万上下文能力。
 
 ## 2. 验收门禁和结论规则
 
@@ -142,8 +141,9 @@ KIMI_MANIFEST=artifacts/merged-baseline-server.json \
 ```
 
 默认固定：TP8+EP、PP1、BF16、Cubic、FlashMLA、`fp8_q16` KV、prefix caching、
-Mamba align/TRITON、chunked prefill、产品验收 `max_model_len=1048576`、max sequences 128、
-batched tokens 2048、GPU memory utilization 0.95、seed 42、K3 API compatibility
+Mamba align/TRITON、chunked prefill、性能阶段 `max_model_len=auto`、max sequences 128、
+batched tokens 2048、GPU memory utilization 0.965、CUDA graph capture 上限 128、
+`prefix-match-unit=32`、seed 42、K3 API compatibility
 和 strict tool calling。性能 benchmark 所需的 `/metrics`、`/server_info` 和
 `/reset_prefix_cache` 依赖 `VLLM_SERVER_DEV_MODE=1`。manifest 必须显示 8 张 H200、
 模型/tokenizer/code revision
@@ -261,8 +261,8 @@ DCP>1 组合。候选、目标指标和最低要求如下：
 
 | profile | 唯一变量 |
 | --- | --- |
-| `baseline` | TP8+EP、DCP1、`fp8_q16`、align prefix cache |
-| `cache32` | 另加 `--prefix-match-unit 32` |
+| `baseline` | TP8+EP、DCP1、`fp8_q16`、align prefix cache、`max-model-len=auto` |
+| `cache32` | 另加 `--prefix-match-unit 32`（当前实测默认） |
 | `dcp2`/`dcp4`/`dcp8` | decode context parallel size |
 | `dspark` | 7 speculative tokens、`TRITON_MLA` draft、DCP1 |
 | `recoverssm` | dSpark + runner V2 + FP32 SSM、DCP1 |
@@ -383,7 +383,7 @@ CUDA/PyTorch/vLLM 版本、完整 CLI（删除 secret）、环境白名单、fix
 | G2 KVV prepare/check | `PASS` | verifier `66092cf`；LFS 8/8；collection 611；`/tmp/kimi-k3-kvv-prep*` |
 | G3 CUDA/H200 构建、数值、加载 | `PENDING` | 当前环境无 NVIDIA GPU/nvcc |
 | G4 在线 KVV | `PENDING` | 未执行真实模型/API 请求 |
-| G5 TTFT/吞吐/缓存率 | `PENDING` | 未启动 H200 服务，未有实测收益 |
+| G5 TTFT/吞吐/缓存率 | `PARTIAL` | H200 已实测；prefix32/128 并发约 3.16M logical TPM、约 31k output TPM，500 万目标和 dSpark 仍待验证 |
 | G6 模型质量 | `PENDING` | 未执行自然停止、长上下文和独立质量集 |
 
 只有 G0-G6 的证据齐全且所有强制门禁通过，才可把候选标记为 `ACCEPTED`。否则使用
