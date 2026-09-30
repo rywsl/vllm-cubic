@@ -2078,9 +2078,7 @@ class KimiK3ForConditionalGeneration(
         path: str = "default",
     ) -> torch.Tensor:
         image_features = self.vision_tower(
-            self._get_pixel_values(mm_kwargs).to(
-                next(self.vision_tower.parameters()).dtype
-            ),
+            self._get_pixel_values(mm_kwargs).to(self.model_config.dtype),
             self._get_grid_thws(mm_kwargs),
         )
         return self._project_encoder_features(torch.cat(image_features))
@@ -2113,7 +2111,10 @@ class KimiK3ForConditionalGeneration(
                 pixel_values.shape[0] * pixel_values.shape[1], *pixel_values.shape[2:]
             )
 
-        target_dtype = next(self.vision_tower.parameters()).dtype
+        # Some vision positional parameters intentionally remain FP32. The
+        # patch embedding and attention weights follow the model dtype, so use
+        # the configured dtype instead of inferring it from the first parameter.
+        target_dtype = self.model_config.dtype
         pixel_values = pixel_values.to(target_dtype)
         assert isinstance(grid_thws, torch.Tensor), (
             f"expect grid_thws to be a tensor, got {type(grid_thws)}"
