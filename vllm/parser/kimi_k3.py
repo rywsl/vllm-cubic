@@ -44,6 +44,21 @@ class KimiK3Parser(DelegatingParser):
         finally:
             request.tools = original_tools
 
+    def extract_reasoning(
+        self,
+        model_output: str,
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> tuple[str | None, str | None]:
+        if not kimi_k3_api_compat_enabled() or not hasattr(request, "messages"):
+            return super().extract_reasoning(model_output, request)
+
+        original_tools = request.tools
+        request.tools = effective_tool_objects(request)
+        try:
+            return super().extract_reasoning(model_output, request)
+        finally:
+            request.tools = original_tools
+
     def _extract_tool_calls(
         self,
         content: str | None,

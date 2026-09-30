@@ -197,7 +197,9 @@ def effective_tool_dicts(request_or_data: Any) -> list[dict[str, Any]]:
             result.append(copy.deepcopy(dict(tool)))
         else:
             dump = getattr(tool, "model_dump", None)
-            result.append(dump(mode="json") if callable(dump) else dict(tool))
+            result.append(
+                dump(mode="json", exclude_none=True) if callable(dump) else dict(tool)
+            )
     if enabled():
         result.extend(dynamic_tool_dicts(messages))
     return result

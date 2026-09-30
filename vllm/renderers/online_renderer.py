@@ -243,13 +243,23 @@ class OnlineRenderer:
                     "--tool-call-parser to be set"
                 )
 
-        effective_tools = effective_tool_objects(request)
+        # K3 dynamic tools are already carried by their system message.  They
+        # must remain available to the parser, but passing them again through
+        # the template-level ``tools`` kwarg duplicates them in K3's prompt.
+        effective_tools = (
+            request.tools
+            if kimi_k3_api_compat_enabled()
+            else effective_tool_objects(request)
+        )
         if not effective_tools or (
             request.tool_choice == "none" and self.exclude_tools_when_tool_choice_none
         ):
             tool_dicts = None
         else:
-            tool_dicts = [tool.model_dump() for tool in effective_tools]
+            tool_dicts = [
+                tool.model_dump(mode="json", exclude_none=True)
+                for tool in effective_tools
+            ]
 
         if not self.use_harmony:
             # Common case.

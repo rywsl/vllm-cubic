@@ -2123,6 +2123,15 @@ def _postprocess_messages(messages: list[ConversationMessage]) -> None:
                             try:
                                 parsed = json.loads(content)
                             except json.JSONDecodeError:
+                                if envs.VLLM_KIMI_K3_API_COMPAT:
+                                    # K3's XTML renderer preserves malformed
+                                    # history as a raw JSON block so the next
+                                    # turn remains token-for-token compatible
+                                    # with the vendor tokenizer.  Generic
+                                    # templates still receive the historical
+                                    # empty-object fallback below.
+                                    function["arguments"] = content
+                                    continue
                                 # A malformed `arguments` string lives in
                                 # conversation history, so failing the request
                                 # here would fail every subsequent turn too and

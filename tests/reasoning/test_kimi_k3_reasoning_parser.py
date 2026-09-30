@@ -3,6 +3,7 @@
 
 import pytest
 
+import vllm.envs as envs
 from vllm.entrypoints.generate.base.protocol import DeltaMessage
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
@@ -92,6 +93,47 @@ def test_delegating_parser_strips_response_wrapper_without_tool_parser():
     assert reasoning == "step"
     assert content == "answer"
     assert tool_calls == []
+
+
+def test_dynamic_tools_preserve_tool_channel_during_non_streaming_parse(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_KIMI_K3_API_COMPAT", True)
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {},
+                                },
+                            },
+                        }
+                    ],
+                },
+                {"role": "user", "content": "weather?"},
+            ],
+            "tool_choice": "required",
+        }
+    )
+    parser = ReasoningOnlyParser(DummyTokenizer())
+    tools = f"{OPEN}tools{SEP}{CLOSE}tools{SEP}"
+
+    reasoning, content = parser.extract_reasoning(
+        f"{THINK_OPEN}step{THINK_CLOSE}{RESPONSE_OPEN}answer"
+        f"{CLOSE}response{SEP}{tools}",
+        request,
+    )
+
+    assert reasoning == "step"
+    assert content == f"{RESPONSE_OPEN}answer{CLOSE}response{SEP}{tools}"
+    assert request.tools is None
 
 
 def test_is_reasoning_end_uses_full_input_ids():

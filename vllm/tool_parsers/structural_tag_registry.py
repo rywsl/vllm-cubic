@@ -481,40 +481,328 @@ def _k3_bounded_string_regex(prop: dict[str, Any]) -> str | None:
     return _K3_STRING_ATOM + f"{{{min_len},{max_len}}}"
 
 
-def _k3_argument_tag(
-    key: str,
-    schema: dict[str, Any],
-    root_defs: dict[str, Any] | None = None,
-) -> TagFormat | None:
-    """Build one ``argument`` XTML tag for property ``key``.
+def _k3_json_pointer_target(document: dict[str, Any], ref: str) -> Any | None:
+    """Resolve a local JSON Schema reference using JSON Pointer semantics.
 
-    ``string`` values are emitted raw (bounded by the close marker); every other
-    JSON type is emitted as JSON and validated against the property schema. A
-    property whose type is a union / missing is left permissive (any XTML type,
-    raw value) so a valid call is never rejected.
-
-    ``root_defs`` carries the tool parameters' root-level ``$defs`` /
-    ``definitions``: slicing a property out of the parameters document orphans
-    its ``#/$defs/...`` references, so those tables must be re-attached to keep
-    the embedded schema self-contained.
+    A property schema is compiled separately from the tool's root schema.  The
+    old resolver only handled one definition name, so references such as
+    ``#/$defs/group/items`` silently fell back to an unconstrained argument.
+    Keep this helper deliberately small and local: external documents are not
+    available to the request-time grammar compiler, while local pointers can
+    be resolved losslessly (including escaped property names and array indices).
     """
-    prop = schema if isinstance(schema, dict) else {}
+    if ref == "#":
+        return document
+    if not ref.startswith("#/"):
+        return None
+
+    current: Any = document
+    for raw_token in ref[2:].split("/"):
+        # JSON Pointer decodes ~1 before ~0; doing it in the opposite order
+        # would turn an escaped literal ``~1`` into a slash.
+        if "~" in raw_token:
+            token_chars: list[str] = []
+            index = 0
+            while index < len(raw_token):
+                char = raw_token[index]
+                if char != "~":
+                    token_chars.append(char)
+                    index += 1
+                    continue
+                if index + 1 >= len(raw_token) or raw_token[index + 1] not in "01":
+                    return None
+                token_chars.append("/" if raw_token[index + 1] == "1" else "~")
+                index += 2
+            token = "".join(token_chars)
+        else:
+            token = raw_token
+
+        if isinstance(current, dict):
+            if token not in current:
+                return None
+            current = current[token]
+        elif isinstance(current, list):
+            if token == "-" or not token.isdigit():
+                return None
+            position = int(token)
+            if position >= len(current):
+                return None
+            current = current[position]
+        else:
+            return None
+    return current
+
+
+def _k3_resolve_root_ref(
+    schema: dict[str, Any], root_schema: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Resolve local ``$ref`` chains while retaining sibling keywords.
+
+    ``root_schema`` is the complete tool-parameter schema, rather than just its
+    ``$defs`` map.  This is required for nested pointers and for ``$ref: "#"``
+    self references.  Cyclic references are left as the final resolved target;
+    JSONSchemaFormat handles the cycle, while ``seen`` prevents this helper from
+    looping forever.
+    """
+    if not root_schema:
+        return schema
+
+    resolved = schema
+    seen: set[str] = set()
+    while True:
+        ref = resolved.get("$ref")
+        if not isinstance(ref, str) or ref in seen:
+            return resolved
+        target = _k3_json_pointer_target(root_schema, ref)
+        if not isinstance(target, dict):
+            return resolved
+        seen.add(ref)
+        merged = dict(target)
+        # JSON Schema allows sibling keywords next to $ref in modern drafts;
+        # preserve them when resolving the outer property for XTML typing.
+        merged.update({key: value for key, value in resolved.items() if key != "$ref"})
+        resolved = merged
+
+
+def _k3_has_root_ref(value: Any) -> bool:
+    """Return whether a schema tree contains a self-reference (``$ref: #``)."""
+    if isinstance(value, dict):
+        if value.get("$ref") == "#":
+            return True
+        return any(_k3_has_root_ref(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_k3_has_root_ref(item) for item in value)
+    return False
+
+
+def _k3_rewrite_root_refs(value: Any, target_ref: str) -> Any:
+    """Copy a schema tree, redirecting root self references to ``target_ref``."""
+    if isinstance(value, dict):
+        return {
+            key: target_ref
+            if key == "$ref" and item == "#"
+            else _k3_rewrite_root_refs(item, target_ref)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_k3_rewrite_root_refs(item, target_ref) for item in value]
+    return value
+
+
+_K3_NO_INSTANCE = object()
+
+
+def _k3_minimal_instance(
+    schema: Any,
+    document: dict[str, Any],
+    resolving_refs: frozenset[str] = frozenset(),
+) -> Any:
+    """Build one finite instance of a schema for a recursive edge.
+
+    xgrammar correctly accepts recursive JSON Schema, but a model can keep
+    selecting an optional recursive property forever.  When a recursive edge
+    is reached we replace that edge with a ``const`` schema.  The value here is
+    deliberately a small valid instance of the referenced schema, so the
+    resulting grammar remains a subset of the request's original schema.
+    """
+    if not isinstance(schema, dict):
+        return _K3_NO_INSTANCE
+
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        if ref in resolving_refs:
+            return _K3_NO_INSTANCE
+        target = _k3_json_pointer_target(document, ref)
+        if isinstance(target, dict):
+            return _k3_minimal_instance(
+                target, document, resolving_refs | frozenset({ref})
+            )
+        return _K3_NO_INSTANCE
+
+    if "const" in schema:
+        return schema["const"]
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        return enum[0]
+
+    for keyword in ("anyOf", "oneOf"):
+        branches = schema.get(keyword)
+        if isinstance(branches, list):
+            for branch in branches:
+                value = _k3_minimal_instance(branch, document, resolving_refs)
+                if value is not _K3_NO_INSTANCE:
+                    return value
+            return _K3_NO_INSTANCE
+
+    all_of = schema.get("allOf")
+    if isinstance(all_of, list) and all_of:
+        values = [
+            _k3_minimal_instance(branch, document, resolving_refs) for branch in all_of
+        ]
+        if all(value is not _K3_NO_INSTANCE for value in values):
+            if all(isinstance(value, dict) for value in values):
+                merged: dict[str, Any] = {}
+                for value in values:
+                    merged.update(value)
+                return merged
+            if values and all(value == values[0] for value in values[1:]):
+                return values[0]
+        return _K3_NO_INSTANCE
+
+    json_type = schema.get("type")
+    if isinstance(json_type, list):
+        for type_name in json_type:
+            if isinstance(type_name, str):
+                branch = dict(schema)
+                branch["type"] = type_name
+                value = _k3_minimal_instance(branch, document, resolving_refs)
+                if value is not _K3_NO_INSTANCE:
+                    return value
+        return _K3_NO_INSTANCE
+
+    if json_type == "null":
+        return None
+    if json_type == "boolean":
+        return False
+    if json_type == "string":
+        minimum = schema.get("minLength", 0)
+        maximum = schema.get("maxLength")
+        length = minimum if isinstance(minimum, int) and minimum > 0 else 1
+        if isinstance(maximum, int) and maximum >= 0:
+            length = min(length, maximum)
+        return "x" * length
+    if json_type in ("integer", "number"):
+        minimum = schema.get("minimum")
+        if isinstance(minimum, (int, float)):
+            return minimum
+        exclusive_minimum = schema.get("exclusiveMinimum")
+        if isinstance(exclusive_minimum, (int, float)):
+            return exclusive_minimum + 1
+        return 0
+    if json_type == "array":
+        items = schema.get("items")
+        minimum_items = schema.get("minItems", 0)
+        count = (
+            minimum_items if isinstance(minimum_items, int) and minimum_items > 0 else 0
+        )
+        if isinstance(items, dict):
+            item = _k3_minimal_instance(items, document, resolving_refs)
+            if count and item is _K3_NO_INSTANCE:
+                return _K3_NO_INSTANCE
+            return [item for _ in range(count)]
+        return []
+    if json_type == "object" or isinstance(schema.get("properties"), dict):
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return {}
+        required = schema.get("required", [])
+        required_names = required if isinstance(required, list) else []
+        result: dict[str, Any] = {}
+        for name in required_names:
+            if not isinstance(name, str) or name not in properties:
+                return _K3_NO_INSTANCE
+            value = _k3_minimal_instance(properties[name], document, resolving_refs)
+            if value is _K3_NO_INSTANCE:
+                return _K3_NO_INSTANCE
+            result[name] = value
+        return result
+
+    return _K3_NO_INSTANCE
+
+
+def _k3_rewrite_recursive_refs(document: dict[str, Any]) -> dict[str, Any]:
+    """Inline local references and replace only the cyclic edges.
+
+    A reference target has to be copied at the reference site for the cycle
+    bound to affect the grammar that xgrammar sees.  Keeping a transformed
+    target only under ``$defs`` leaves the original reference graph intact and
+    still permits unbounded generation.  The expansion is finite because a
+    reference already present in ``active_refs`` becomes a valid ``const``
+    instance instead of being followed again.
+    """
+
+    def expand(value: Any, active_refs: frozenset[str]) -> Any:
+        if isinstance(value, list):
+            return [expand(item, active_refs) for item in value]
+        if not isinstance(value, dict):
+            return value
+
+        ref = value.get("$ref")
+        if isinstance(ref, str):
+            target = _k3_json_pointer_target(document, ref)
+            if isinstance(target, dict):
+                if ref in active_refs:
+                    terminal = _k3_minimal_instance(target, document, active_refs)
+                    if terminal is _K3_NO_INSTANCE:
+                        # Keep grammar construction total for schemas without
+                        # a finite instance; verifier-runnable schemas have a
+                        # valid branch and use the more precise value above.
+                        terminal = {}
+                    return {"const": terminal}
+
+                expanded = expand(target, active_refs | frozenset({ref}))
+                if isinstance(expanded, dict):
+                    # JSON Schema permits siblings alongside ``$ref``.  Apply
+                    # them after expanding the target and keep their own local
+                    # references bounded by the same active path.
+                    expanded.update(
+                        {
+                            key: expand(child, active_refs)
+                            for key, child in value.items()
+                            if key != "$ref"
+                        }
+                    )
+                return expanded
+
+        return {key: expand(child, active_refs) for key, child in value.items()}
+
+    return expand(document, frozenset())
+
+
+def _k3_schema_alternatives(
+    schema: dict[str, Any], root_schema: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    """Expand root refs and schema unions into scalar-type alternatives."""
+    schema = _k3_resolve_root_ref(schema, root_schema)
+    for keyword in ("anyOf", "oneOf"):
+        branches = schema.get(keyword)
+        if isinstance(branches, list) and branches:
+            alternatives: list[dict[str, Any]] = []
+            for branch in branches:
+                if isinstance(branch, dict):
+                    alternatives.extend(_k3_schema_alternatives(branch, root_schema))
+            if alternatives:
+                return alternatives
+            return []
+
+    json_type = schema.get("type")
+    if isinstance(json_type, list):
+        alternatives = []
+        for type_name in json_type:
+            if isinstance(type_name, str):
+                branch = dict(schema)
+                branch["type"] = type_name
+                alternatives.append(branch)
+        return alternatives
+    return [schema] if isinstance(json_type, str) else []
+
+
+def _k3_argument_tag_for_schema(
+    key: str,
+    prop: dict[str, Any],
+    root_schema: dict[str, Any] | None,
+) -> TagFormat | None:
+    prop = _k3_resolve_root_ref(prop, root_schema)
     json_type = prop.get("type")
     xtml_type = (
         _K3_JSON_TO_XTML_TYPE.get(json_type) if isinstance(json_type, str) else None
     )
     if xtml_type is None:
-        # Unknown / union type: constrain the key but keep the value permissive.
         return None
     begin = (
         f'{_K3_OPEN}argument key="{_k3_escape_attr(key)}" type="{xtml_type}"{_K3_SEP}'
     )
     if xtml_type == "string":
-        # Raw string channel: JSONSchemaFormat can't apply (values are not
-        # JSON-quoted), but an enum/const of strings is a finite set that can
-        # be enforced exactly with const-string alternation. Enum semantics
-        # are exclusive, so this never over-rejects. Fall back to permissive
-        # AnyText for open-ended strings or non-representable enums.
         enum_values = prop.get("enum")
         if enum_values is None and isinstance(prop.get("const"), str):
             enum_values = [prop["const"]]
@@ -535,12 +823,85 @@ def _k3_argument_tag(
             content = AnyTextFormat(excludes=[_K3_CLOSE])
     else:
         embedded = prop
-        if root_defs:
+        if root_schema:
             embedded = dict(prop)
-            for defs_key, defs_value in root_defs.items():
-                embedded.setdefault(defs_key, defs_value)
+            # A property is compiled as its own JSON Schema document. Keep the
+            # parameter root's definition tables available to local pointers,
+            # and redirect ``$ref: "#"`` in recursive properties to a
+            # synthetic root definition instead of changing its meaning to the
+            # sliced property schema.
+            if _k3_has_root_ref(prop):
+                root_name = "__k3_root"
+                raw_defs = root_schema.get("$defs")
+                defs = dict(raw_defs) if isinstance(raw_defs, dict) else {}
+                while root_name in defs:
+                    root_name = f"_{root_name}"
+                root_ref = f"#/$defs/{root_name}"
+                root_copy = _k3_rewrite_root_refs(root_schema, root_ref)
+                # Use the rewritten copies too: a definition nested under the
+                # root may itself contain ``$ref: "#"``.
+                raw_defs = root_copy.get("$defs")
+                defs = dict(raw_defs) if isinstance(raw_defs, dict) else {}
+                raw_definitions = root_copy.get("definitions")
+                definitions = (
+                    dict(raw_definitions) if isinstance(raw_definitions, dict) else {}
+                )
+                root_target = {
+                    key: value
+                    for key, value in root_copy.items()
+                    if key not in ("$defs", "definitions", "$id")
+                }
+                defs[root_name] = root_target
+                embedded = _k3_rewrite_root_refs(embedded, root_ref)
+                if defs:
+                    embedded["$defs"] = defs
+                if definitions:
+                    embedded["definitions"] = definitions
+            else:
+                for defs_key in ("$defs", "definitions"):
+                    defs_value = root_schema.get(defs_key)
+                    if isinstance(defs_value, dict):
+                        embedded.setdefault(defs_key, defs_value)
+            # xgrammar's recursive JSON-schema support is semantically sound,
+            # but a model can repeatedly choose an optional recursive branch
+            # and exhaust the generation budget before closing the tool call.
+            # Bound only the cyclic edges; ordinary references remain strict.
+            embedded = _k3_rewrite_recursive_refs(embedded)
         content = JSONSchemaFormat(json_schema=embedded)
     return TagFormat(begin=begin, content=content, end=_K3_ARG_CLOSE)
+
+
+def _k3_argument_tag(
+    key: str,
+    schema: dict[str, Any],
+    root_schema: dict[str, Any] | None = None,
+) -> Any:
+    """Build one ``argument`` XTML tag for property ``key``.
+
+    ``string`` values are emitted raw (bounded by the close marker); every other
+    JSON type is emitted as JSON and validated against the property schema.
+    Union schemas become alternatives with a fixed XTML ``type=`` attribute.
+    Schemas without a concrete type remain permissive so a valid call is never
+    rejected.
+
+    ``root_schema`` carries the complete tool parameters document: slicing a
+    property out of it orphans ``#/$defs/...`` and ``#`` references, so the
+    relevant context is re-attached to keep the embedded schema self-contained.
+    """
+    if not isinstance(schema, dict):
+        return None
+    alternatives = _k3_schema_alternatives(schema, root_schema)
+    tags = [
+        tag
+        for alternative in alternatives
+        if (tag := _k3_argument_tag_for_schema(key, alternative, root_schema))
+        is not None
+    ]
+    if not tags:
+        # Unknown / unconstrained type: constrain the key through the
+        # permissive fallback in _k3_arguments_block.
+        return None
+    return tags[0] if len(tags) == 1 else OrFormat(elements=tags)
 
 
 def _k3_permissive_argument_tag() -> TagFormat:
@@ -574,14 +935,9 @@ def _k3_arguments_block(parameters: dict[str, Any] | bool) -> Any:
     if not isinstance(props, dict) or not props:
         # No declared properties: allow any argument blocks (or none).
         return StarFormat(content=_k3_permissive_argument_tag())
-    root_defs = {
-        defs_key: parameters[defs_key]
-        for defs_key in ("$defs", "definitions")
-        if isinstance(parameters.get(defs_key), dict)
-    }
     tags: list[TagFormat] = []
     for key, prop in props.items():
-        tag = _k3_argument_tag(key, prop, root_defs)
+        tag = _k3_argument_tag(key, prop, parameters)
         tags.append(tag if tag is not None else _k3_permissive_argument_tag())
     inner = tags[0] if len(tags) == 1 else OrFormat(elements=list(tags))
     required = parameters.get("required")
@@ -608,7 +964,7 @@ def _k3_call_tag(tool: FunctionToolParam) -> TagFormat:
     )
 
 
-def _k3_response_prefix() -> list[Any]:
+def _k3_response_prefix(max_chars: int | None = None) -> list[Any]:
     """The response channel that always precedes the tools channel.
 
     ``response`` is generated in thinking mode (prefix ends at
@@ -621,7 +977,10 @@ def _k3_response_prefix() -> list[Any]:
         OptionalFormat(content=ConstStringFormat(value=_K3_RESPONSE_OPEN)),
         TagFormat(
             begin="",
-            content=AnyTextFormat(excludes=[_K3_OPEN, _K3_CLOSE, _K3_END_OF_MSG]),
+            content=AnyTextFormat(
+                excludes=[_K3_OPEN, _K3_CLOSE, _K3_END_OF_MSG],
+                max_chars=max_chars,
+            ),
             end=_K3_RESPONSE_CLOSE,
         ),
     ]
@@ -651,9 +1010,17 @@ def get_kimi_k3_structural_tag(
 
     trailer = OptionalFormat(content=ConstStringFormat(value=_K3_MESSAGE_CLOSE))
 
+    # A required tool call must reach the tools channel within the generation
+    # budget.  Recursive JSON schemas can otherwise make the model spend the
+    # entire budget in free-form response text before it emits the mandatory
+    # call.  Keep a short natural-language lead-in while bounding that escape.
+    response_max_chars = 256 if tool_choice in ("forced", "required") else None
+
     if not tools:
         return StructuralTag(
-            format=SequenceFormat(elements=[*_k3_response_prefix(), trailer])
+            format=SequenceFormat(
+                elements=[*_k3_response_prefix(response_max_chars), trailer]
+            )
         )
 
     if tool_choice == "auto":
@@ -666,7 +1033,9 @@ def get_kimi_k3_structural_tag(
         tools_part = _k3_tools_channel(tools)
 
     return StructuralTag(
-        format=SequenceFormat(elements=[*_k3_response_prefix(), tools_part, trailer])
+        format=SequenceFormat(
+            elements=[*_k3_response_prefix(response_max_chars), tools_part, trailer]
+        )
     )
 
 

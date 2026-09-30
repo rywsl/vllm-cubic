@@ -104,6 +104,16 @@ def normalize_kimi_k3_request(data: Any) -> Any:
     result = dict(data)
     _validate_response_format(result)
 
+    # The K3 vendor contract accepts only the string forms of tool_choice.
+    # OpenAI's named-function object is parsed by the generic vLLM request
+    # model, but K3 has no named-call mode and must reject it at the API edge.
+    if isinstance(result.get("tool_choice"), dict):
+        raise _bad(
+            "tool_choice",
+            'Kimi K3 supports only "auto", "none", or "required" for tool_choice.',
+            result["tool_choice"],
+        )
+
     raw_template_kwargs = result.get("chat_template_kwargs")
     if raw_template_kwargs is None:
         template_kwargs: dict[str, Any] = {}
@@ -166,8 +176,13 @@ def normalize_kimi_k3_request(data: Any) -> Any:
             "thinking.type", "`type` must be enabled or disabled.", thinking_type
         )
     keep = thinking.get("keep", "all")
-    if keep not in _KEEP_VALUES:
+    if thinking_type == "enabled" and keep not in _KEEP_VALUES:
         raise _bad("thinking.keep", "`keep` must be all or history.", keep)
+    if thinking_type == "disabled":
+        # K3 ignores ``keep`` when reasoning is disabled.  Normalize to the
+        # canonical value used by the chat template so arbitrary client values
+        # cannot cause a template validation failure.
+        keep = "all"
     effort = thinking.get("effort")
     if effort is not None and effort not in _EFFORTS:
         raise _bad("thinking.effort", "Invalid thinking effort.", effort)

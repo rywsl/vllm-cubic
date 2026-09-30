@@ -731,6 +731,164 @@ def test_kimi_k3_property_ref_to_root_defs_compiles_and_accepts():
     assert _is_grammar_accept_string(grammar, body)
 
 
+def test_kimi_k3_direct_root_ref_uses_definition_schema():
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={
+                "name": "make_config",
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"$ref": "#/$defs/db"}},
+                    "required": ["value"],
+                    "$defs": {"db": {"additionalProperties": False, "type": "object"}},
+                },
+            },
+        )
+    ]
+    grammar = _k3_grammar("required", tools=tools)
+    valid = _k3_response() + _k3_tools(
+        _k3_call("make_config", _k3_arg("value", "object", "{}"))
+    )
+    invalid = valid.replace("{}", '{"schema": {}}')
+
+    assert _is_grammar_accept_string(grammar, valid)
+    assert not _is_grammar_accept_string(grammar, invalid)
+
+
+def test_kimi_k3_union_and_type_array_arguments_keep_schema_constraints():
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={
+                "name": "set_value",
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "value": {
+                            "anyOf": [
+                                {"type": ["boolean"]},
+                                {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "integer",
+                                        "enum": [1, 2, 3],
+                                    },
+                                },
+                            ]
+                        }
+                    },
+                    "required": ["value"],
+                },
+            },
+        )
+    ]
+    grammar = _k3_grammar("required", tools=tools)
+
+    def body(value: str, typ: str) -> str:
+        return _k3_response() + _k3_tools(
+            _k3_call("set_value", _k3_arg("value", typ, value))
+        )
+
+    assert _is_grammar_accept_string(grammar, body("true", "boolean"))
+    assert _is_grammar_accept_string(grammar, body("[1,2]", "array"))
+    assert not _is_grammar_accept_string(grammar, body("[true]", "array"))
+
+
+def test_kimi_k3_nested_json_pointer_ref_keeps_schema_constraints():
+    """Resolve refs below a definition node instead of falling back to free text."""
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={
+                "name": "set_values",
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"values": {"$ref": "#/$defs/group/items"}},
+                    "required": ["values"],
+                    "$defs": {
+                        "group": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {"id": {"type": "integer"}},
+                                "required": ["id"],
+                                "additionalProperties": False,
+                            },
+                        }
+                    },
+                },
+            },
+        )
+    ]
+    grammar = _k3_grammar("required", tools=tools)
+    valid = _k3_response() + _k3_tools(
+        _k3_call("set_values", _k3_arg("values", "object", '{"id": 1}'))
+    )
+    invalid = valid.replace('{"id": 1}', '{"id": "one"}')
+
+    assert _is_grammar_accept_string(grammar, valid)
+    assert not _is_grammar_accept_string(grammar, invalid)
+
+
+def test_kimi_k3_json_pointer_decodes_escaped_definition_name():
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={
+                "name": "set_value",
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"$ref": "#/$defs/a~1b"}},
+                    "required": ["value"],
+                    "$defs": {
+                        "a/b": {
+                            "type": "object",
+                            "properties": {"ok": {"type": "boolean"}},
+                            "required": ["ok"],
+                            "additionalProperties": False,
+                        }
+                    },
+                },
+            },
+        )
+    ]
+    grammar = _k3_grammar("required", tools=tools)
+    body = _k3_response() + _k3_tools(
+        _k3_call("set_value", _k3_arg("value", "object", '{"ok": true}'))
+    )
+    assert _is_grammar_accept_string(grammar, body)
+
+
+def test_kimi_k3_root_self_ref_is_rebound_when_property_is_embedded():
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={
+                "name": "set_tree",
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"tree": {"type": "array", "items": {"$ref": "#"}}},
+                    # The recursive item can terminate at an empty root
+                    # object; requiring ``tree`` here would be an inherently
+                    # non-terminating schema and is rejected by KVV itself.
+                    "required": [],
+                },
+            },
+        )
+    ]
+    grammar = _k3_grammar("required", tools=tools)
+    body = _k3_response() + _k3_tools(
+        _k3_call("set_tree", _k3_arg("tree", "array", "[{}]"))
+    )
+    assert _is_grammar_accept_string(grammar, body)
+
+
 def _k3_tools_with_string_enum() -> list[ChatCompletionToolsParam]:
     return [
         ChatCompletionToolsParam(

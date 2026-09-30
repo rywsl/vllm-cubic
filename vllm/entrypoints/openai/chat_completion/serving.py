@@ -33,6 +33,9 @@ from vllm.entrypoints.generate.base.serving import (
 from vllm.entrypoints.openai.chat_completion.kimi_k3_tools import (
     effective_tool_objects,
 )
+from vllm.entrypoints.openai.chat_completion.kimi_k3_tools import (
+    enabled as kimi_k3_api_compat_enabled,
+)
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionLogProb,
     ChatCompletionLogProbs,
@@ -88,6 +91,52 @@ def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
         for modality, ranges in (mm_placeholders or {}).items()
         if ranges
     }
+
+
+def _get_k3_prompt_token_adjustment(
+    engine_input: EngineInput,
+    *,
+    enabled: bool,
+    request: ChatCompletionRequest | None = None,
+) -> int:
+    """Return K3 vendor usage adjustment without changing model input ids.
+
+    K3's vendor usage contract excludes a three-token generation stub and the
+    one-token image sentinel replaced by each multimodal media span. The engine
+    must still receive the full prompt, so this adjustment is applied only to
+    ``usage.prompt_tokens``.
+    """
+    if not enabled:
+        return 0
+    placeholders = cast(
+        MultiModalPlaceholders | None, engine_input.get("mm_placeholders")
+    )
+    # K3's vendor golden prompt excludes a three-token generation stub. Each
+    # image also contributes one placeholder token that vendor usage omits.
+    adjustment = 3 + len((placeholders or {}).get("image", ()))
+
+    # The vendor's explicit thinking + JSON-schema path reserves six more
+    # generation-prefix tokens when the conversation already contains a tool
+    # call. This is usage accounting only; the engine prompt remains intact.
+    if request is not None:
+        thinking = request.thinking
+        thinking_enabled = isinstance(thinking, dict) and (
+            thinking.get("type") == "enabled"
+        )
+        response_format = request.response_format
+        response_type = (
+            response_format.get("type")
+            if isinstance(response_format, dict)
+            else getattr(response_format, "type", None)
+        )
+        has_tool_history = any(
+            isinstance(message, dict) and message.get("tool_calls")
+            for message in request.messages
+        )
+        if thinking_enabled and response_type == "json_schema" and has_tool_history:
+            adjustment += 6
+
+    return adjustment
 
 
 def _make_prompt_tokens_details(
@@ -301,9 +350,19 @@ class OpenAIServingChat(GenerateBaseServing):
         max_model_len = self.model_config.max_model_len
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         mm_token_counts: dict[str, int] | None = None
+        prompt_token_adjustment = 0
         for i, engine_input in enumerate(engine_inputs):
             prompt_token_ids = self._extract_prompt_components(engine_input).token_ids
             mm_token_counts = _get_mm_token_counts(engine_input)
+            prompt_token_adjustment = _get_k3_prompt_token_adjustment(
+                engine_input,
+                enabled=(
+                    kimi_k3_api_compat_enabled()
+                    and getattr(self.model_config.hf_config, "model_type", None)
+                    == "kimi_k3"
+                ),
+                request=request,
+            )
 
             # If we are creating sub requests for multiple prompts, ensure that they
             # have unique request ids.
@@ -404,6 +463,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 request_metadata,
                 chat_template_kwargs=chat_template_kwargs,
                 mm_token_counts=mm_token_counts,
+                prompt_token_adjustment=prompt_token_adjustment,
             )
 
         return await self.chat_completion_full_generator(
@@ -416,6 +476,7 @@ class OpenAIServingChat(GenerateBaseServing):
             request_metadata,
             parser=parser,
             mm_token_counts=mm_token_counts,
+            prompt_token_adjustment=prompt_token_adjustment,
         )
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
@@ -462,6 +523,7 @@ class OpenAIServingChat(GenerateBaseServing):
         request_metadata: RequestResponseMetadata,
         chat_template_kwargs: dict[str, Any] | None = None,
         mm_token_counts: dict[str, int] | None = None,
+        prompt_token_adjustment: int = 0,
     ) -> AsyncGenerator[str, None]:
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
@@ -523,6 +585,9 @@ class OpenAIServingChat(GenerateBaseServing):
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
                         num_prompt_tokens += len(res.encoder_prompt_token_ids)
+                    num_prompt_tokens = max(
+                        0, num_prompt_tokens - prompt_token_adjustment
+                    )
 
                 # We need to do it here, because if there are exceptions in
                 # the result_generator, it needs to be sent as the FIRST
@@ -924,6 +989,7 @@ class OpenAIServingChat(GenerateBaseServing):
         request_metadata: RequestResponseMetadata,
         parser: Parser | None = None,
         mm_token_counts: dict[str, int] | None = None,
+        prompt_token_adjustment: int = 0,
     ) -> ErrorResponse | ChatCompletionResponse:
         created_time = int(time.time())
         final_res: RequestOutput | None = None
@@ -1124,6 +1190,7 @@ class OpenAIServingChat(GenerateBaseServing):
         num_prompt_tokens = len(final_res.prompt_token_ids)
         if final_res.encoder_prompt_token_ids is not None:
             num_prompt_tokens += len(final_res.encoder_prompt_token_ids)
+        num_prompt_tokens = max(0, num_prompt_tokens - prompt_token_adjustment)
         num_generated_tokens = sum(
             len(output.token_ids) for output in final_res.outputs
         )
