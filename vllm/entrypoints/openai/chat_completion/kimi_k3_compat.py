@@ -14,6 +14,12 @@ _EFFORTS = ("low", "high", "max")
 _THINKING_KEYS = frozenset(("type", "keep", "effort"))
 _KEEP_VALUES = ("all", "history")
 
+# A required tool call must leave enough output budget for the XTML tool
+# channel.  K3's reasoning can otherwise consume a short request's entire
+# ``max_tokens`` before it reaches the call marker.
+KIMI_K3_REQUIRED_TOOL_THINKING_TOKEN_BUDGET = 256
+KIMI_K3_EFFORT_EXPLICIT_KEY = "_kimi_k3_effort_explicit"
+
 
 def kimi_k3_api_compat_enabled() -> bool:
     return bool(envs.VLLM_KIMI_K3_API_COMPAT)
@@ -21,6 +27,40 @@ def kimi_k3_api_compat_enabled() -> bool:
 
 def _bad(parameter: str, message: str, value: Any = None) -> VLLMValidationError:
     return VLLMValidationError(message, parameter=parameter, value=value)
+
+
+def kimi_k3_thinking_token_budget(
+    request: Any, current_budget: int | None
+) -> int | None:
+    """Apply K3's bounded budget for implicit required-tool reasoning.
+
+    The budget is deliberately applied at sampling-parameter construction so
+    the regular ``thinking_token_budget`` engine path enforces the limit. An
+    explicitly supplied budget or effort always takes precedence.
+    """
+    if (
+        current_budget is not None
+        or "thinking_token_budget" in getattr(request, "model_fields_set", set())
+        or not kimi_k3_api_compat_enabled()
+    ):
+        return current_budget
+    if getattr(request, "tool_choice", None) != "required":
+        return current_budget
+
+    thinking = getattr(request, "thinking", None)
+    if not isinstance(thinking, dict) or thinking.get("type") != "enabled":
+        return current_budget
+    if getattr(request, "_kimi_k3_effort_explicit", False):
+        return current_budget
+
+    # Include tools declared on K3 system messages as well as top-level tools.
+    from vllm.entrypoints.openai.chat_completion.kimi_k3_tools import (
+        effective_tool_objects,
+    )
+
+    if not effective_tool_objects(request):
+        return current_budget
+    return KIMI_K3_REQUIRED_TOOL_THINKING_TOKEN_BUDGET
 
 
 def _validate_number(data: dict[str, Any], name: str, *, default: float) -> None:
@@ -104,6 +144,28 @@ def normalize_kimi_k3_request(data: Any) -> Any:
     result = dict(data)
     _validate_response_format(result)
 
+    raw_template_kwargs = result.get("chat_template_kwargs")
+    if isinstance(raw_template_kwargs, dict):
+        template_kwargs: dict[str, Any] = dict(raw_template_kwargs)
+    else:
+        template_kwargs = {}
+
+    # Keep this bit of request provenance because the normalized ``thinking``
+    # object below fills an omitted effort with ``max``. The sampler must still
+    # distinguish an implicit default from an explicitly requested effort.
+    explicit_effort = isinstance(result.get("thinking"), dict) and (
+        "effort" in result["thinking"]
+    )
+    explicit_effort = explicit_effort or (
+        result.get("reasoning_effort") is not None
+        and result.get("reasoning_effort") != "none"
+    )
+    explicit_effort = explicit_effort or "thinking_effort" in template_kwargs
+    marker = result.get(KIMI_K3_EFFORT_EXPLICIT_KEY)
+    if isinstance(marker, bool):
+        explicit_effort = marker
+    result[KIMI_K3_EFFORT_EXPLICIT_KEY] = explicit_effort
+
     # The K3 vendor contract accepts only the string forms of tool_choice.
     # OpenAI's named-function object is parsed by the generic vLLM request
     # model, but K3 has no named-call mode and must reject it at the API edge.
@@ -114,17 +176,12 @@ def normalize_kimi_k3_request(data: Any) -> Any:
             result["tool_choice"],
         )
 
-    raw_template_kwargs = result.get("chat_template_kwargs")
-    if raw_template_kwargs is None:
-        template_kwargs: dict[str, Any] = {}
-    elif not isinstance(raw_template_kwargs, dict):
+    if raw_template_kwargs is not None and not isinstance(raw_template_kwargs, dict):
         raise _bad(
             "chat_template_kwargs",
             "`chat_template_kwargs` must be an object.",
             raw_template_kwargs,
         )
-    else:
-        template_kwargs = dict(raw_template_kwargs)
 
     if "thinking" in template_kwargs and not isinstance(
         template_kwargs["thinking"], bool

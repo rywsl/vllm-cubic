@@ -231,3 +231,72 @@ def test_k3_parser_receives_dynamic_tools_for_structural_tag(monkeypatch):
     ]
     assert adjusted.structured_outputs is not None
     assert adjusted.structured_outputs.structural_tag is not None
+
+
+def test_k3_required_tool_call_gets_default_thinking_budget(monkeypatch):
+    """Implicit K3 reasoning leaves room for a required XTML tool call."""
+    monkeypatch.setattr(envs, "VLLM_KIMI_K3_API_COMPAT", True)
+    request = ChatCompletionRequest.model_validate(
+        _payload(
+            tools=[_weather_tool()],
+            tool_choice="required",
+            thinking={"type": "enabled"},
+        )
+    )
+
+    params = request.to_sampling_params(2048, {})
+
+    assert params.thinking_token_budget == 256
+
+
+def test_k3_required_tool_call_preserves_explicit_budget_and_effort(monkeypatch):
+    """Explicit request controls must not be replaced by the default cap."""
+    monkeypatch.setattr(envs, "VLLM_KIMI_K3_API_COMPAT", True)
+    explicit_budget = ChatCompletionRequest.model_validate(
+        _payload(
+            tools=[_weather_tool()],
+            tool_choice="required",
+            thinking={"type": "enabled"},
+            thinking_token_budget=512,
+        )
+    )
+    explicit_effort = ChatCompletionRequest.model_validate(
+        _payload(
+            tools=[_weather_tool()],
+            tool_choice="required",
+            thinking={"type": "enabled", "effort": "high"},
+        )
+    )
+    explicit_unlimited = ChatCompletionRequest.model_validate(
+        _payload(
+            tools=[_weather_tool()],
+            tool_choice="required",
+            thinking={"type": "enabled"},
+            thinking_token_budget=-1,
+        )
+    )
+
+    assert explicit_budget.to_sampling_params(2048, {}).thinking_token_budget == 512
+    assert explicit_effort.to_sampling_params(2048, {}).thinking_token_budget is None
+    assert explicit_unlimited.to_sampling_params(2048, {}).thinking_token_budget is None
+
+
+def test_k3_default_thinking_budget_only_applies_to_required_tools(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_KIMI_K3_API_COMPAT", True)
+    no_tools = ChatCompletionRequest.model_validate(
+        _payload(thinking={"type": "enabled"})
+    )
+    optional_tool = ChatCompletionRequest.model_validate(
+        _payload(tools=[_weather_tool()], tool_choice="auto")
+    )
+    disabled = ChatCompletionRequest.model_validate(
+        _payload(
+            tools=[_weather_tool()],
+            tool_choice="required",
+            thinking={"type": "disabled"},
+        )
+    )
+
+    assert no_tools.to_sampling_params(2048, {}).thinking_token_budget is None
+    assert optional_tool.to_sampling_params(2048, {}).thinking_token_budget is None
+    assert disabled.to_sampling_params(2048, {}).thinking_token_budget is None

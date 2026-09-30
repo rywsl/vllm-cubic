@@ -585,10 +585,26 @@ class ChatCompletionRequest(OpenAIBaseModel):
             tool_calls = msg.get("tool_calls")
             if tool_calls is not None and not isinstance(tool_calls, list):
                 msg["tool_calls"] = list(tool_calls)
+
+        # ``normalize_kimi_k3_request`` keeps this provenance bit in the
+        # model's extra fields because Pydantic otherwise cannot distinguish an
+        # omitted effort from the normalized default ``max``. Consume it into a
+        # private attribute before the request reaches serving code.
+        from vllm.entrypoints.openai.chat_completion.kimi_k3_compat import (
+            KIMI_K3_EFFORT_EXPLICIT_KEY,
+        )
+
+        extra = self.__pydantic_extra__
+        if extra is not None:
+            marker = extra.pop(KIMI_K3_EFFORT_EXPLICIT_KEY, None)
+            if isinstance(marker, bool):
+                self._kimi_k3_effort_explicit = marker
         return self
 
     _grammar_from_parser: bool = PrivateAttr(default=False)
     """CAUTION: Should only be set by the parser-engine adapter's adjust_request."""
+
+    _kimi_k3_effort_explicit: bool = PrivateAttr(default=False)
 
     def build_chat_params(
         self,
@@ -712,6 +728,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
         max_tokens: int,
         default_sampling_params: dict,
     ) -> SamplingParams:
+        from vllm.entrypoints.openai.chat_completion.kimi_k3_compat import (
+            kimi_k3_thinking_token_budget,
+        )
+
         # Default parameters
         if (repetition_penalty := self.repetition_penalty) is None:
             repetition_penalty = default_sampling_params.get(
@@ -750,6 +770,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
         prompt_logprobs = self.prompt_logprobs
         if prompt_logprobs is None and self.echo:
             prompt_logprobs = self.top_logprobs
+
+        thinking_token_budget = kimi_k3_thinking_token_budget(
+            self, self.thinking_token_budget
+        )
 
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
@@ -791,7 +815,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             structured_outputs=self.extract_structured_outputs(),
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
-            thinking_token_budget=self.thinking_token_budget,
+            thinking_token_budget=thinking_token_budget,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
