@@ -16,7 +16,11 @@ from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
-from vllm.multimodal.parse import ImageProcessorItems, ImageSize, MultiModalDataItems
+from vllm.multimodal.parse import (
+    ImageSize,
+    MultiModalDataItems,
+    VisionChunkProcessorItems,
+)
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
@@ -30,6 +34,10 @@ from vllm.multimodal.processing import (
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.processor import cached_get_image_processor
 from vllm.transformers_utils.processors.kimi_k3 import KimiK3Processor
+from vllm.transformers_utils.processors.kimi_k25_vision_fused import (
+    KimiK25FusedVisionProcessor,
+)
+from vllm.utils.import_utils import is_numba_available
 
 logger = init_logger(__name__)
 
@@ -88,12 +96,11 @@ def navit_resize_image(
 
 
 class KimiK3ProcessingInfo(BaseProcessingInfo):
-    """Processing information for the image-only Kimi-K3 model.
+    """Processing information for Kimi-K3 image and video chunks.
 
-    K3 uses the standard ``image`` modality (unlike K2.5's unified
-    ``vision_chunk``), so it builds its own ``KimiK3Processor`` wrapper around
-    the checkpoint's image processor and resolves the ``<|media_pad|>`` token
-    id the same way K2.5 does.
+    Both images and decoded video frame chunks use the unified
+    ``vision_chunk`` modality. This keeps the flattened ``pixel_values`` and
+    ``grid_thws`` fields aligned when a request mixes images and videos.
     """
 
     def __init__(self, ctx: InputProcessingContext) -> None:
@@ -102,10 +109,14 @@ class KimiK3ProcessingInfo(BaseProcessingInfo):
         self.hf_config = hf_config = self.get_hf_config()
 
         tokenizer = self.get_tokenizer()
+        processor_cls = KimiK25FusedVisionProcessor if is_numba_available() else None
+        if processor_cls is None:
+            raise RuntimeError("Kimi-K3 video support requires numba for preprocessing")
         image_processor = cached_get_image_processor(
             self.ctx.model_config.model,
             revision=self.ctx.model_config.revision,
             trust_remote_code=self.ctx.model_config.trust_remote_code,
+            processor_cls_overrides=processor_cls,
         )
 
         # Resolve token ID from the tokenizer because transformers v5
@@ -148,7 +159,7 @@ class KimiK3ProcessingInfo(BaseProcessingInfo):
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         # None means unlimited
-        return {"image": None}
+        return {"vision_chunk": None}
 
     @classmethod
     def get_max_image_size(
@@ -197,8 +208,8 @@ class KimiK3DummyInputsBuilder(BaseDummyInputsBuilder[KimiK3ProcessingInfo]):
     """
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
-        num_images = mm_counts.get("image", 0)
-        return self.info.get_hf_config().image_placeholder * num_images
+        num_media = mm_counts.get("vision_chunk", 0)
+        return self.info.get_hf_config().image_placeholder * num_media
 
     def get_dummy_mm_data(
         self,
@@ -216,20 +227,56 @@ class KimiK3DummyInputsBuilder(BaseDummyInputsBuilder[KimiK3ProcessingInfo]):
         )
         image_overrides = cast(
             ImageDummyOptions | None,
-            mm_options.get("image") if mm_options else None,
+            mm_options.get("vision_chunk") if mm_options else None,
         )
         return {
-            "image": self._get_dummy_images(
-                width=max_size.width,
-                height=max_size.height,
-                num_images=mm_counts.get("image", 0),
-                overrides=image_overrides,
-            )
+            "vision_chunk": [
+                {"type": "image", "image": image}
+                for image in self._get_dummy_images(
+                    width=max_size.width,
+                    height=max_size.height,
+                    num_images=mm_counts.get("vision_chunk", 0),
+                    overrides=image_overrides,
+                )
+            ]
         }
 
 
 class KimiK3MultiModalProcessor(BaseMultiModalProcessor[KimiK3ProcessingInfo]):
-    """Image-only multi-modal processor for Kimi-K3."""
+    """Multi-modal processor for Kimi-K3 images and decoded video frames."""
+
+    @staticmethod
+    def _get_media_size(media: dict[str, Any]) -> tuple[int, int]:
+        frame = media["image"] if media["type"] == "image" else media["video_chunk"][0]
+        if hasattr(frame, "media"):
+            frame = frame.media
+        if hasattr(frame, "size") and not hasattr(frame, "shape"):
+            width, height = frame.size
+            return int(width), int(height)
+        shape = getattr(frame, "shape", None)
+        if shape is None or len(shape) != 3:
+            raise ValueError(f"Unsupported media frame shape: {shape}")
+        if shape[-1] in (1, 3, 4):
+            height, width = shape[:2]
+        else:
+            height, width = shape[-2:]
+        return int(width), int(height)
+
+    def _limit_video_frames(self, media: dict[str, Any]) -> dict[str, Any]:
+        if media.get("type") != "video_chunk":
+            return media
+        frames = media["video_chunk"]
+        max_frames = getattr(self.info.image_processor, "num_frames_per_chunk", 4)
+        if len(frames) <= max_frames:
+            return media
+        if max_frames <= 1:
+            indices = [0]
+        else:
+            indices = [
+                round(i * (len(frames) - 1) / (max_frames - 1))
+                for i in range(max_frames)
+            ]
+        return {**media, "video_chunk": [frames[i] for i in indices]}
 
     def _get_mm_fields_config(
         self,
@@ -246,8 +293,10 @@ class KimiK3MultiModalProcessor(BaseMultiModalProcessor[KimiK3ProcessingInfo]):
         grid_sizes = grid_thws.prod(-1)
 
         return dict(
-            pixel_values=MultiModalFieldConfig.flat_from_sizes("image", grid_sizes),
-            grid_thws=MultiModalFieldConfig.batched("image", keep_on_cpu=True),
+            pixel_values=MultiModalFieldConfig.flat_from_sizes(
+                "vision_chunk", grid_sizes
+            ),
+            grid_thws=MultiModalFieldConfig.batched("vision_chunk", keep_on_cpu=True),
         )
 
     def _get_prompt_updates(
@@ -256,7 +305,7 @@ class KimiK3MultiModalProcessor(BaseMultiModalProcessor[KimiK3ProcessingInfo]):
         hf_processor_mm_kwargs: Mapping[str, Any],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
-        """Expand each K3 image placeholder into a resolution-aware update.
+        """Expand each K3 media placeholder into a resolution-aware update.
 
         K3's prompt carries a single ``<|kimi_image_placeholder|>`` token per
         image. This replaces that token with
@@ -271,16 +320,20 @@ class KimiK3MultiModalProcessor(BaseMultiModalProcessor[KimiK3ProcessingInfo]):
         tokenizer = self.info.get_tokenizer()
 
         def get_replacement(item_idx: int) -> PromptUpdateDetails:
-            images = mm_items.get_items("image", ImageProcessorItems)
-            image = images.get(item_idx)
-            if image is None:
-                raise ValueError(f"Missing image data at index {item_idx}")
-
-            # The checkpoint image processor works on media dicts, so wrap the
-            # PIL image before asking it for the token count.
-            num_media_token = self.info.media_tokens_calculator(
-                {"type": "image", "image": image}
-            )
+            media_items = mm_items.get_items("vision_chunk", VisionChunkProcessorItems)
+            media = media_items.get(item_idx)
+            if media is None:
+                raise ValueError(f"Missing media data at index {item_idx}")
+            if hasattr(media, "media"):
+                media = media.media
+            if isinstance(media, dict):
+                media_dict = media
+            elif isinstance(media, tuple) and len(media) == 2:
+                media_dict = {"type": "video_chunk", "video_chunk": media[0]}
+            else:
+                media_dict = {"type": "image", "image": media}
+            media_dict = self._limit_video_frames(media_dict)
+            num_media_token = self.info.media_tokens_calculator(media_dict)
             pads = media_token * num_media_token
 
             # NOTE: `width`/`height` are the ORIGINAL upload dimensions, not the
@@ -291,7 +344,7 @@ class KimiK3MultiModalProcessor(BaseMultiModalProcessor[KimiK3ProcessingInfo]):
             # the reference HF processor (`KimiK3Processor.preprocess_medias`),
             # which also builds the prompt from the original `img.size`. The
             # resize is reflected only in the pad count above.
-            width, height = images.get_image_size(item_idx)
+            width, height = self._get_media_size(media_dict)
             full = (
                 f"<|media_begin|>image {width}x{height}<|media_content|>"
                 f"{pads}<|media_end|>"
@@ -304,7 +357,7 @@ class KimiK3MultiModalProcessor(BaseMultiModalProcessor[KimiK3ProcessingInfo]):
 
         return [
             PromptReplacement(
-                modality="image",
+                modality="vision_chunk",
                 target=cached_encode(
                     tokenizer, image_placeholder, add_special_tokens=False
                 ),

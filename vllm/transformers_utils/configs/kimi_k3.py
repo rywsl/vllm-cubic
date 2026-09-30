@@ -94,6 +94,7 @@ class KimiK3Config(PretrainedConfig):
         media_placeholder_token_id: int = 163605,
         pad_token_id: int = 0,
         image_placeholder: str = "<|kimi_image_placeholder|>",
+        use_unified_vision_chunk: bool = True,
         **kwargs,
     ):
         if text_config is None:
@@ -124,6 +125,10 @@ class KimiK3Config(PretrainedConfig):
         self.ignore_index = ignore_index
         self.media_placeholder_token_id = media_placeholder_token_id
         self.image_placeholder = image_placeholder
+        # K3 uses one MoonViT3D input path for still images and frame stacks.
+        # Keeping both under one modality also lets the encoder preserve the
+        # item order while using the same pixel/grid keyword arguments.
+        self.use_unified_vision_chunk = use_unified_vision_chunk
 
         if getattr(self.text_config, "quantization_config", None) is not None:
             self.quantization_config = self.text_config.quantization_config

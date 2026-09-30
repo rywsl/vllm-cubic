@@ -1794,7 +1794,7 @@ class KimiK3ForConditionalGeneration(
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
-        if modality == "image":
+        if modality in ("image", "video", "vision_chunk"):
             return "<|kimi_image_placeholder|>"
         raise ValueError(f"Unsupported modality: {modality}")
 
@@ -1818,7 +1818,7 @@ class KimiK3ForConditionalGeneration(
         self.hidden_size = config.text_config.hidden_size
         self.device = current_platform.current_device()
 
-        with self._mark_tower_model(vllm_config, "image"):
+        with self._mark_tower_model(vllm_config, "vision_chunk"):
             self.vision_tower = MoonViT3dPretrainedModel(
                 config.vision_config,
                 quant_config=self._maybe_ignore_quant_config(quant_config),
@@ -1850,7 +1850,7 @@ class KimiK3ForConditionalGeneration(
                         dtype=vision_attn.dtype,
                         max_batch_size=(
                             vllm_config.scheduler_config.max_num_seqs
-                            * mm_config.get_limit_per_prompt("image")
+                            * mm_config.get_limit_per_prompt("vision_chunk")
                         ),
                         max_seqlen=(
                             vllm_config.scheduler_config.max_num_encoder_input_tokens
@@ -1890,7 +1890,7 @@ class KimiK3ForConditionalGeneration(
         from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
 
         return EncoderCudaGraphConfig(
-            modalities=["image"],
+            modalities=["vision_chunk"],
             buffer_keys=[
                 "pixel_values",
                 "pos_embeds",
@@ -1939,7 +1939,10 @@ class KimiK3ForConditionalGeneration(
         return [
             EncoderItemSpec(
                 input_size=t * h * w,
-                output_tokens=(h // kh) * (w // kw),
+                # MoonViT3D's temporal pooling path has a different execution
+                # shape for frame stacks. Keep CUDA Graph capture for still
+                # images and use eager execution for videos.
+                output_tokens=(h // kh) * (w // kw) if t == 1 else 2**30,
             )
             for t, h, w in self._get_grid_thws(mm_kwargs)
         ]

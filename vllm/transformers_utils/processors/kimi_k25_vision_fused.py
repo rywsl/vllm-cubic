@@ -155,6 +155,18 @@ def _to_pil(data: Any) -> Image.Image:
         return Image.open(data).convert("RGB")
     if isinstance(data, bytes):
         return Image.open(io.BytesIO(data)).convert("RGB")
+    if isinstance(data, np.ndarray):
+        if data.ndim != 3:
+            raise ValueError(
+                f"Expected an image array with 3 dimensions, got {data.shape}"
+            )
+        if data.shape[-1] == 1:
+            data = data[..., 0]
+        if data.dtype.kind == "f":
+            data = (data.clip(0, 1) * 255).astype(np.uint8)
+        else:
+            data = data.astype(np.uint8, copy=False)
+        return Image.fromarray(data).convert("RGB")
     raise ValueError(f"Unsupported data type: {type(data)}")
 
 
