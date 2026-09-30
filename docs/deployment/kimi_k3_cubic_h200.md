@@ -102,8 +102,9 @@ KIMI_MANIFEST=artifacts/merged-baseline-server.json \
 | `dspark` | 固定 draft revision，7 speculative tokens，DCP1 |
 | `recoverssm` | dSpark + RecoverSSM + runner V2 + FP32 SSM |
 
-默认 max model length 1048576、max sequences 128、batched tokens 2048、
-GPU memory utilization 0.95、seed 42。OOM 时先降低并发或 memory utilization，
+性能调优默认使用 `max-model-len=auto`、max sequences 128、batched tokens 2048、
+GPU memory utilization 0.965、CUDA graph capture 上限 128、`prefix-match-unit=32`、
+seed 42。1M 上下文切换和验收后置，不把本阶段的 auto 结果当作 1M 能力证明。OOM 时先降低并发或 memory utilization，
 并把相同参数应用于对照组。`KIMI_BATCHED_TOKENS` 可逐项尝试 1024/2048/4096；
 `KIMI_KV_CACHE_DTYPE` 支持 `auto`、`bfloat16`、`fp8_q16`、`cubic8`，
 dSpark/RecoverSSM 预设限定 target 为 `fp8_q16`。
