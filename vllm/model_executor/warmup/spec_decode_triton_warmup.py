@@ -132,7 +132,17 @@ def _warm_mamba_state_migration(model_runner: "GPUModelRunner") -> None:
         for index, group in enumerate(model_runner.kv_cache_config.kv_cache_groups)
         if isinstance(group.kv_cache_spec, MambaSpec)
     ]
-    bufs = model_runner._get_mamba_bufs()
+    # V2 model runners do not expose the legacy aligned-mamba buffer helper.
+    # The runtime initializes these buffers on demand, so skip this optional
+    # warmup instead of failing engine startup.
+    get_mamba_bufs = getattr(model_runner, "_get_mamba_bufs", None)
+    if get_mamba_bufs is None:
+        logger.warning_once(
+            "Skipping aligned-mamba speculative warmup: model runner does not "
+            "expose _get_mamba_bufs()."
+        )
+        return
+    bufs = get_mamba_bufs()
     context = bufs.postprocess_align
     assert context is not None
     assert context.mamba_state_idx_buf is not None
